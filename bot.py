@@ -1,95 +1,119 @@
 import os
-import logging
-import asyncio
-from datetime import datetime, timedelta
-from telegram import Update, ChatPermissions
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    filters, ContextTypes
-)
+import json
+import time
+import datetime
+from flask import Flask, request
+from telegram import Update, ChatPermissions, ChatMember
+from telegram.ext import Application, Dispatcher, MessageHandler, filters, CommandHandler
 
-# Config
-TOKEN = os.getenv("TOKEN")
-SPAM_LIMIT = 5
-MUTE_TIME = 10 * 60
-THALA_LIMIT = 3
+app = Flask(__name__)
 
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+TOKEN = '8203076967:AAGPApD2JB_6ZmtZsB4fb0PTyEAFB1IwRpQ'  # Replace with your actual bot token from BotFather
 
-user_messages = {}
-user_thala_count = {}
-last_reset_date = datetime.now().date()
+# Data storage
+user_data = {}  # For thala limits {user_id: {'count': int, 'date': date}}
+user_messages = {}  # For spam detection {user_id: [timestamps]}
 
-def reset_daily_limits():
-    global user_thala_count, last_reset_date
-    today = datetime.now().date()
-    if today != last_reset_date:
-        user_thala_count = {}
-        last_reset_date = today
+DATA_FILE = 'data.json'
 
-async def mute_user(context, chat_id, user_id):
-    await context.bot.restrict_chat_member(
-        chat_id,
-        user_id,
-        ChatPermissions(can_send_messages=False),
-        until_date=datetime.now() + timedelta(seconds=MUTE_TIME)
-    )
-    await context.bot.send_message(chat_id, "User muted for 10 minutes due to spam.")
+def load_data():
+    global user_data
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, 'r') as f:
+                user_data = json.load(f)
+        except json.JSONDecodeError:
+            user_data = {}
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "**Help Menu**\n"
-        "- Spam Detection → auto mute 10 min\n"
-        "- 'Thala' limit → 3 times/day\n"
-        "- !rules (admin only)\n"
-        "- Made by Aashirwadgamerzz",
-        parse_mode="Markdown"
-    )
+def save_data():
+    with open(DATA_FILE, 'w') as f:
+        json.dump(user_data, f)
 
-async def rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    member = await update.effective_chat.get_member(user.id)
-    if member.status not in ("administrator", "creator"):
-        await update.message.reply_text("Only admins can use this command.")
+load_data()
+
+async def message_handler(update: Update, context):
+    message = update.message
+    if not message or not message.text:
         return
-    await update.message.reply_text("#1 Spam is not allowed")
 
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reset_daily_limits()
-    msg = update.message
-    user_id = msg.from_user.id
-    chat_id = msg.chat_id
-    text = msg.text.lower()
+    user_id = message.from_user.id
+    chat_id = message.chat_id
+    text = message.text.lower().strip()
 
+    # Spam detection: flood control (more than 5 messages in 10 seconds)
+    current_time = time.time()
     if user_id not in user_messages:
         user_messages[user_id] = []
-    user_messages[user_id].append(datetime.now())
-    user_messages[user_id] = [
-        t for t in user_messages[user_id] if (datetime.now() - t).seconds < 10
-    ]
+    user_messages[user_id].append(current_time)
+    user_messages[user_id] = [t for t in user_messages[user_id] if current_time - t < 10]
 
-    if len(user_messages[user_id]) > SPAM_LIMIT:
-        await mute_user(context, chat_id, user_id)
-        user_messages[user_id] = []
+    if len(user_messages[user_id]) > 5:
+        # Check if user is admin
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        if member.status not in (ChatMember.ADMINISTRATOR, ChatMember.OWNER):
+            # Mute for 10 minutes
+            until_date = int(current_time + 600)
+            permissions = ChatPermissions(
+                can_send_messages=False,
+                can_send_media_messages=False,
+                can_send_polls=False,
+                can_send_other_messages=False,
+                can_add_web_page_previews=False,
+                can_change_info=False,
+                can_invite_users=False,
+                can_pin_messages=False
+            )
+            await context.bot.restrict_chat_member(
+                chat_id, user_id, permissions=permissions, until_date=until_date
+            )
+            await message.reply_text("You have been muted for 10 minutes due to spamming.")
+            user_messages[user_id] = []  # Reset after mute
 
-    if "thala" in text:
-        count = user_thala_count.get(user_id, 0) + 1
-        user_thala_count[user_id] = count
-        if count > THALA_LIMIT:
-            await msg.delete()
-            await msg.reply_text("You thala limit has reached!")
+    # Thala limit check
+    if text == 'thala':
+        today = datetime.date.today()
+        if user_id not in user_data:
+            user_data[user_id] = {'count': 0, 'date': today}
+        
+        if user_data[user_id]['date'] != today:
+            user_data[user_id]['count'] = 0
+            user_data[user_id]['date'] = today
+        
+        if user_data[user_id]['count'] < 3:
+            user_data[user_id]['count'] += 1
+            save_data()
         else:
-            await msg.reply_text(f"Thala count: {count}/3")
+            await message.delete()
+            await message.reply_text("Your thala limit has reached!")
 
-async def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(MessageHandler(filters.Regex(r"^!rules$"), rules_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-    await app.run_polling()
+    # !rules command
+    if message.text.startswith('!rules'):
+        await message.reply_text("#1 spam is not allowed")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+async def help_command(update: Update, context):
+    help_text = """
+Help:
+- Spam detection: Users muted for 10 minutes if sending more than 5 messages in 10 seconds.
+- Thala limit: You can type 'thala' only 3 times per day. Exceeding deletes the message and notifies you.
+- !rules: Shows rules.
+- Made by aashirwadgamerzz
+"""
+    await update.message.reply_text(help_text)
+
+# Set up dispatcher
+application = Application.builder().token(TOKEN).build()
+dispatcher = application.dispatcher
+dispatcher.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+dispatcher.add_handler(CommandHandler('help', help_command))
+
+@app.route('/' + TOKEN, methods=['GET', 'POST'])
+def webhook():
+    if request.method == 'POST':
+        update = Update.de_json(request.get_json(force=True), application.bot)
+        dispatcher.process_update(update)
+    return 'OK'
+
+if __name__ == '__main__':
+    # For local testing: app.run(port=5000)
+    # For Render: Run as web service (no need for app.run, use gunicorn)
+    pass
