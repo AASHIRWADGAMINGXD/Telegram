@@ -31,7 +31,6 @@ from telegram.ext import (
 
 # ----------------- CONFIG -----------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 ADMIN_PASSWORD_ENV = os.environ.get("ADMIN_PASSWORD")  # plaintext on first-run (optional)
 DB_PATH = os.environ.get("DB_PATH", "moderator_bot.db")
 
