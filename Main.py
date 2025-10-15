@@ -9,7 +9,13 @@ from telegram.ext import (
     filters,
 )
 import os
+from google.cloud import firestore
 
+db = firestore.Client()
+
+def save_user(user_id, name):
+    db.collection("users").document(str(user_id)).set({"name": name})
+    
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "letmein")
 
