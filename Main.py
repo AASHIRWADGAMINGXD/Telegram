@@ -10,6 +10,8 @@ from telegram.ext import (
 )
 import os
 from google.cloud import firestore
+import requests
+result = requests.post("https://my-cloudrun-app.a.run.app/api", json={"data": "test"})
 
 db = firestore.Client()
 
