@@ -9,7 +9,7 @@ Usage on Render:
 - Add BOT_TOKEN and VEO2_API to environment.
 - Start the service with: python bot.py
 """
-
+import imghdr_pure as imghdr
 import os
 import json
 import logging
