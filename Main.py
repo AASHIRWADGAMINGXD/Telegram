@@ -1,188 +1,300 @@
-import asyncio
-from datetime import datetime
-from telegram import Update, ChatPermissions
+#!/usr/bin/env python3
+"""
+Telegram image generator bot with simple password privacy.
+Requires two environment variables:
+  BOT_TOKEN  -> Telegram bot token
+  VEO2_API   -> API key or endpoint token for your VEO2 image service
+
+Usage on Render:
+- Add BOT_TOKEN and VEO2_API to environment.
+- Start the service with: python bot.py
+"""
+
+import os
+import json
+import logging
+import hashlib
+import secrets
+import base64
+import requests
+from pathlib import Path
+from functools import wraps
+from telegram import Update, InputFile
 from telegram.ext import (
-    Application,
+    Updater,
     CommandHandler,
     MessageHandler,
-    ContextTypes,
     filters,
+    CallbackContext,
 )
-import os
-from google.cloud import firestore
-import requests
-result = requests.post("https://my-cloudrun-app.a.run.app/api", json={"data": "test"})
 
-db = firestore.Client()
-
-def save_user(user_id, name):
-    db.collection("users").document(str(user_id)).set({"name": name})
-    
+# === Configuration ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "letmein")
+VEO2_API = os.getenv("VEO2_API")  # could be a key or full endpoint depending on provider
+DATA_FILE = Path("data.json")
+# salt for hashing - random per-deploy; stored in file for repeatable hashes
+DEFAULT_SALT_KEY = "salt"
 
-admins = set()
-thala_count = {}
-daily_reset_time = datetime.now().day
-warns = {}
-start_time = datetime.now()
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-# ---------- BASIC ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Bot is online!\n\nUse /login <password> to access admin commands."
+# === Data persistence helpers ===
+def load_data():
+    if not DATA_FILE.exists():
+        return {}
+    try:
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        logger.exception("Failed to read data file")
+        return {}
+
+def save_data(d):
+    with open(DATA_FILE, "w") as f:
+        json.dump(d, f, indent=2)
+
+data = load_data()
+# ensure salt exists
+if DEFAULT_SALT_KEY not in data:
+    data[DEFAULT_SALT_KEY] = secrets.token_hex(16)
+    save_data(data)
+
+def hash_password(password: str) -> str:
+    """Return hex digest of password with per-repo salt."""
+    salt = data.get(DEFAULT_SALT_KEY, "")
+    h = hashlib.sha256((password + salt).encode("utf-8")).hexdigest()
+    return h
+
+def set_owner(owner_id: int, password: str):
+    data["owner_id"] = owner_id
+    data["password_hash"] = hash_password(password)
+    data.setdefault("allowed", [])
+    # owner should be allowed
+    if owner_id not in data["allowed"]:
+        data["allowed"].append(owner_id)
+    save_data(data)
+
+def change_password(new_password: str):
+    data["password_hash"] = hash_password(new_password)
+    save_data(data)
+
+def check_password(password: str) -> bool:
+    stored = data.get("password_hash")
+    if not stored:
+        return False
+    return hash_password(password) == stored
+
+def add_allowed(user_id: int):
+    data.setdefault("allowed", [])
+    if user_id not in data["allowed"]:
+        data["allowed"].append(user_id)
+        save_data(data)
+
+def is_allowed(user_id: int) -> bool:
+    return user_id in data.get("allowed", [])
+
+def owner_only(func):
+    @wraps(func)
+    def wrapper(update: Update, context: CallbackContext):
+        user_id = update.effective_user.id
+        if data.get("owner_id") != user_id:
+            update.message.reply_text("Only the owner can run this command.")
+            return
+        return func(update, context)
+    return wrapper
+
+# === VEO2 image request logic ===
+def call_veo2_api(prompt: str) -> dict:
+    """
+    Generic call to VEO2 API.
+    This function tries two common patterns:
+     - POST to VEO2_API (if VEO2_API looks like a URL) with JSON {"prompt": ...}
+     - POST to a fixed endpoint using the VEO2_API as an API key: header Authorization: Bearer <VEO2_API>
+    The actual VEO2 provider may require tweaks. Adjust as necessary.
+    Returns a dict with keys:
+      - 'image_bytes' (bytes) OR 'image_url' (str)
+    """
+    headers = {}
+    payload = {"prompt": prompt}
+    try:
+        if VEO2_API is None:
+            raise RuntimeError("VEO2_API is not configured.")
+        # Decide if VEO2_API looks like a URL
+        if VEO2_API.lower().startswith("http://") or VEO2_API.lower().startswith("https://"):
+            # treat VEO2_API as a full endpoint
+            endpoint = VEO2_API
+            resp = requests.post(endpoint, json=payload, timeout=60)
+        else:
+            # treat VEO2_API as an API key for a default endpoint
+            # Replace below default endpoint with provider's if you know it.
+            default_endpoint = "https://api.veo.example/v2/generate"  # placeholder
+            headers["Authorization"] = f"Bearer {VEO2_API}"
+            resp = requests.post(default_endpoint, json=payload, headers=headers, timeout=60)
+
+        resp.raise_for_status()
+        j = resp.json()
+    except Exception as e:
+        # Try to treat VEO2_API as an endpoint and fallback to a simplified POST (no JSON)
+        logger.exception("VEO2 API call failed")
+        raise
+
+    # Normalized response handling:
+    # Common patterns:
+    #  1) { "image": "<base64string>" }
+    #  2) { "image_base64": "..." }
+    #  3) { "url": "https://..." }
+    #  4) { "images": ["https://..."] }
+    if isinstance(j, dict):
+        if "image" in j and isinstance(j["image"], str):
+            try:
+                img_bytes = base64.b64decode(j["image"])
+                return {"image_bytes": img_bytes}
+            except Exception:
+                pass
+        if "image_base64" in j and isinstance(j["image_base64"], str):
+            img_bytes = base64.b64decode(j["image_base64"])
+            return {"image_bytes": img_bytes}
+        if "url" in j and isinstance(j["url"], str):
+            return {"image_url": j["url"]}
+        if "images" in j and isinstance(j["images"], list) and j["images"]:
+            first = j["images"][0]
+            # if it's base64:
+            if isinstance(first, str) and first.startswith("data:"):
+                # data URI
+                comma = first.find(",")
+                payload = first[comma+1:]
+                img_bytes = base64.b64decode(payload)
+                return {"image_bytes": img_bytes}
+            else:
+                return {"image_url": first}
+    # If unknown format, return the full json for debug
+    return {"raw": j}
+
+# === Bot command handlers ===
+def start_handler(update: Update, context: CallbackContext):
+    user = update.effective_user
+    txt = (
+        "Hello. This is a private image-generation bot.\n\n"
+        "If password not set, the first person to run /setpass <password> will become the owner.\n\n"
+        "Commands:\n"
+        "/setpass <password> - set password and become owner (only if not set)\n"
+        "/changepass <newpassword> - change password (owner only)\n"
+        "/register <password> - register yourself to use the bot\n"
+        "/generate <prompt> - generate an image (registered users only)\n"
+        "/status - show owner and registration status\n"
+    )
+    update.message.reply_text(txt)
+
+def status_handler(update: Update, context: CallbackContext):
+    owner = data.get("owner_id")
+    owner_line = f"{owner}" if owner else "No owner set"
+    allowed = data.get("allowed", [])
+    you_allowed = "Yes" if update.effective_user.id in allowed else "No"
+    update.message.reply_text(
+        f"Owner: {owner_line}\nRegistered users: {len(allowed)}\nYou registered: {you_allowed}"
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("""
-🤖 Commands:
-/login <password> - Become admin
-/help - Show this menu
-/rules - Show rules
-/status - Bot uptime
-
-Admin:
-/mute (reply)
-/unmute (reply)
-/ban (reply)
-/unban <user_id>
-/kick (reply)
-/warn (reply)
-/warnings (reply)
-/slowmode <sec>
-/lock
-/unlock
-""")
-
-async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📜 Rules: No spam, respect others, stay chill.")
-
-# ---------- LOGIN ----------
-async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("Usage: /login <password>")
-    if context.args[0] == ADMIN_PASSWORD:
-        admins.add(update.effective_user.id)
-        await update.message.reply_text("✅ Access granted! You’re now an admin.")
-    else:
-        await update.message.reply_text("❌ Wrong password.")
-
-def is_admin(user_id):
-    return user_id in admins
-
-# ---------- MODERATION ----------
-async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
-    if not update.message.reply_to_message: return
-    member = update.message.reply_to_message.from_user
-    await update.effective_chat.restrict_member(member.id, ChatPermissions(can_send_messages=False))
-    await update.message.reply_text(f"🔇 {member.first_name} muted.")
-
-async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
-    if not update.message.reply_to_message: return
-    member = update.message.reply_to_message.from_user
-    await update.effective_chat.restrict_member(member.id, ChatPermissions(can_send_messages=True))
-    await update.message.reply_text(f"🔊 {member.first_name} unmuted.")
-
-async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
-    if not update.message.reply_to_message: return
-    member = update.message.reply_to_message.from_user
-    await update.effective_chat.ban_member(member.id)
-    await update.message.reply_text(f"⛔ {member.first_name} banned.")
-
-async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
-    if not context.args: return
-    user_id = int(context.args[0])
-    await update.effective_chat.unban_member(user_id)
-    await update.message.reply_text("✅ User unbanned.")
-
-async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
-    if not update.message.reply_to_message: return
-    member = update.message.reply_to_message.from_user
-    await update.effective_chat.ban_member(member.id)
-    await update.effective_chat.unban_member(member.id)
-    await update.message.reply_text(f"👢 {member.first_name} kicked.")
-
-# ---------- WARN ----------
-async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
-    if not update.message.reply_to_message: return
-    user = update.message.reply_to_message.from_user
-    warns[user.id] = warns.get(user.id, 0) + 1
-    await update.message.reply_text(f"⚠️ {user.first_name} warned ({warns[user.id]}×).")
-
-async def warnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message: return
-    user = update.message.reply_to_message.from_user
-    await update.message.reply_text(f"{user.first_name} has {warns.get(user.id, 0)} warnings.")
-
-# ---------- CHAT CONTROL ----------
-async def lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
-    await update.effective_chat.set_permissions(ChatPermissions(can_send_messages=False))
-    await update.message.reply_text("🔒 Chat locked.")
-
-async def unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
-    await update.effective_chat.set_permissions(ChatPermissions(can_send_messages=True))
-    await update.message.reply_text("🔓 Chat unlocked.")
-
-async def slowmode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
-    if not context.args: return
-    try:
-        sec = int(context.args[0])
-        await update.effective_chat.set_slow_mode_delay(sec)
-        await update.message.reply_text(f"🐢 Slowmode set to {sec}s.")
-    except:
-        await update.message.reply_text("Please enter a number.")
-
-# ---------- THALA ----------
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global daily_reset_time
-    text = update.message.text.lower()
+def setpass_handler(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
-    if datetime.now().day != daily_reset_time:
-        thala_count.clear()
-        daily_reset_time = datetime.now().day
-    if "thala" in text:
-        thala_count[user_id] = thala_count.get(user_id, 0) + 1
-        if thala_count[user_id] > 3:
-            await update.message.delete()
-            await update.message.reply_text("⚠️ Thala limit reached (3/day)!")
+    args = context.args
+    if not args:
+        update.message.reply_text("Usage: /setpass <password>")
+        return
+    password = " ".join(args).strip()
+    if "owner_id" in data:
+        update.message.reply_text("Password already set. Owner already exists.")
+        return
+    set_owner(user_id, password)
+    update.message.reply_text("Password set. You are now owner and registered.")
 
-# ---------- STATUS ----------
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uptime = datetime.now() - start_time
-    await update.message.reply_text(f"✅ Uptime: {str(uptime).split('.')[0]}")
+@owner_only
+def changepass_handler(update: Update, context: CallbackContext):
+    args = context.args
+    if not args:
+        update.message.reply_text("Usage: /changepass <newpassword>")
+        return
+    newpass = " ".join(args).strip()
+    change_password(newpass)
+    update.message.reply_text("Password changed successfully.")
 
-# ---------- MAIN ----------
-async def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+def register_handler(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    args = context.args
+    if "password_hash" not in data:
+        update.message.reply_text("No password configured yet. Owner must set one with /setpass.")
+        return
+    if not args:
+        update.message.reply_text("Usage: /register <password>")
+        return
+    password = " ".join(args).strip()
+    if check_password(password):
+        add_allowed(user_id)
+        update.message.reply_text("Registration successful. You can now use /generate.")
+    else:
+        update.message.reply_text("Incorrect password.")
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("rules", rules))
-    app.add_handler(CommandHandler("login", login))
-    app.add_handler(CommandHandler("mute", mute))
-    app.add_handler(CommandHandler("unmute", unmute))
-    app.add_handler(CommandHandler("ban", ban))
-    app.add_handler(CommandHandler("unban", unban))
-    app.add_handler(CommandHandler("kick", kick))
-    app.add_handler(CommandHandler("warn", warn))
-    app.add_handler(CommandHandler("warnings", warnings))
-    app.add_handler(CommandHandler("lock", lock))
-    app.add_handler(CommandHandler("unlock", unlock))
-    app.add_handler(CommandHandler("slowmode", slowmode))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+def generate_handler(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        update.message.reply_text("You are not registered. Use /register <password> to register.")
+        return
+    args = context.args
+    if not args:
+        update.message.reply_text("Usage: /generate <prompt>\nOr reply to the bot with /generate while including your prompt.")
+        return
+    prompt = " ".join(args).strip()
+    message = update.message.reply_text("Generating image... please wait.")
+    try:
+        result = call_veo2_api(prompt)
+    except Exception as e:
+        logger.exception("Generation failed")
+        message.edit_text(f"Image generation failed: {e}")
+        return
 
-    print("✅ Bot is live (24/7).")
-    await app.run_polling()
+    # send image depending on result
+    if result.get("image_bytes"):
+        bio = BytesIO(result["image_bytes"])
+        bio.name = "image.png"
+        bio.seek(0)
+        update.message.reply_photo(photo=InputFile(bio), caption="Here is your image.")
+        message.delete()
+        return
+    if result.get("image_url"):
+        url = result["image_url"]
+        update.message.reply_photo(photo=url, caption="Here is your image.")
+        message.delete()
+        return
+
+    # fallback: show raw JSON
+    message.edit_text(f"Received unexpected response: {json.dumps(result)[:800]}")
+
+# small helper for BytesIO
+from io import BytesIO
+
+def unknown_handler(update: Update, context: CallbackContext):
+    update.message.reply_text("Unknown command. Use /start to see usage.")
+
+# === Main ===
+def main():
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN is not set. Exiting.")
+        return
+    updater = Updater(token=BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("start", start_handler))
+    dp.add_handler(CommandHandler("status", status_handler))
+    dp.add_handler(CommandHandler("setpass", setpass_handler))
+    dp.add_handler(CommandHandler("changepass", changepass_handler))
+    dp.add_handler(CommandHandler("register", register_handler))
+    dp.add_handler(CommandHandler("generate", generate_handler))
+
+    dp.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), unknown_handler))
+
+    logger.info("Starting bot. Press Ctrl+C to stop.")
+    updater.start_polling()
+    updater.idle()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
