@@ -1,251 +1,90 @@
-#!/usr/bin/env python3
-"""
-Telegram image generator bot with simple password privacy.
-Requires two environment variables:
-  BOT_TOKEN  -> Telegram bot token
-  VEO2_API   -> API key or endpoint token for your VEO2 image service
-"""
-import os
-import json
 import logging
-import hashlib
-import secrets
-import base64
-import requests
-from pathlib import Path
-from functools import wraps
-from io import BytesIO
-from telegram import Update, InputFile
-from telegram.ext import (
-    Updater,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    CallbackContext,
+import http.client
+import json
+import asyncio
+import os
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+from keep_alive import keep_alive
+
+# Enable logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 
-# === Config ===
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-VEO2_API = os.getenv("VEO2_API")
-DATA_FILE = Path("data.json")
-DEFAULT_SALT_KEY = "salt"
+# --- Configuration ---
+# REPLACE 'YOUR_TELEGRAM_BOT_TOKEN' with the token from @BotFather
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+# Your RapidAPI Key
+RAPID_API_KEY = os.environ.get("RAPID_API_KEY", "fc841d3a88msh005d875d98f2e62p186a2ejsn8a7a33ad1274")
 
-# === Data persistence ===
-def load_data():
-    if not DATA_FILE.exists():
-        return {}
+def get_llama_response(user_text):
+    """
+    Synchronous function to call the Llama API using http.client.
+    """
     try:
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    except:
-        logger.exception("Failed to read data.json")
-        return {}
+        conn = http.client.HTTPSConnection("open-ai21.p.rapidapi.com")
+        
+        # safely escape the user text for JSON
+        payload_dict = {
+            "messages": [{"role": "user", "content": user_text}],
+            "web_access": False
+        }
+        payload = json.dumps(payload_dict)
 
-def save_data(d):
-    with open(DATA_FILE, "w") as f:
-        json.dump(d, f, indent=2)
+        headers = {
+            'x-rapidapi-key': RAPID_API_KEY,
+            'x-rapidapi-host': "open-ai21.p.rapidapi.com",
+            'Content-Type': "application/json"
+        }
 
-data = load_data()
+        conn.request("POST", "/conversationllama", payload, headers)
 
-if DEFAULT_SALT_KEY not in data:
-    data[DEFAULT_SALT_KEY] = secrets.token_hex(16)
-    save_data(data)
+        res = conn.getresponse()
+        data = res.read()
+        
+        # Decode and parse response
+        decoded_data = data.decode("utf-8")
+        json_data = json.loads(decoded_data)
+        
+        # Adjust this key based on the exact API response structure.
+        # usually it is 'result' or inside 'choices' for Llama APIs on RapidAPI.
+        # Based on common RapidAPI patterns, we return the whole text or specific field:
+        return json_data.get('result', decoded_data)
 
-def hash_password(password):
-    salt = data.get(DEFAULT_SALT_KEY, "")
-    return hashlib.sha256((password + salt).encode()).hexdigest()
-
-def set_owner(owner_id, password):
-    data["owner_id"] = owner_id
-    data["password_hash"] = hash_password(password)
-    data.setdefault("allowed", [])
-    if owner_id not in data["allowed"]:
-        data["allowed"].append(owner_id)
-    save_data(data)
-
-def change_password(newpw):
-    data["password_hash"] = hash_password(newpw)
-    save_data(data)
-
-def check_password(password):
-    if "password_hash" not in data:
-        return False
-    return hash_password(password) == data["password_hash"]
-
-def add_allowed(uid):
-    data.setdefault("allowed", [])
-    if uid not in data["allowed"]:
-        data["allowed"].append(uid)
-        save_data(data)
-
-def is_allowed(uid):
-    return uid in data.get("allowed", [])
-
-def owner_only(func):
-    @wraps(func)
-    def wrapper(update, context):
-        if update.effective_user.id != data.get("owner_id"):
-            update.message.reply_text("Only the owner can run this command.")
-            return
-        return func(update, context)
-    return wrapper
-
-# === VEO2 API ===
-def call_veo2_api(prompt):
-    if not VEO2_API:
-        raise RuntimeError("VEO2_API is not configured.")
-
-    headers = {}
-    payload = {"prompt": prompt}
-
-    if VEO2_API.lower().startswith("http"):
-        resp = requests.post(VEO2_API, json=payload, timeout=60)
-    else:
-        headers["Authorization"] = f"Bearer {VEO2_API}"
-        endpoint = "https://api.veo.example/v2/generate"
-        resp = requests.post(endpoint, json=payload, headers=headers, timeout=60)
-
-    resp.raise_for_status()
-    j = resp.json()
-
-    # base64 bytes
-    if "image" in j:
-        try:
-            return {"image_bytes": base64.b64decode(j["image"])}
-        except:
-            pass
-    if "image_base64" in j:
-        return {"image_bytes": base64.b64decode(j["image_base64"])}
-
-    # URL
-    if "url" in j:
-        return {"image_url": j["url"]}
-
-    # list
-    if "images" in j and j["images"]:
-        first = j["images"][0]
-        if first.startswith("data:"):
-            encoded = first.split(",", 1)[1]
-            return {"image_bytes": base64.b64decode(encoded)}
-        return {"image_url": first}
-
-    return {"raw": j}
-
-# === Commands ===
-def start_handler(update, context):
-    update.message.reply_text(
-        "Welcome.\n\n"
-        "/setpass <pw> – set password & become owner\n"
-        "/register <pw> – register yourself\n"
-        "/generate <prompt> – generate image\n"
-        "/changepass <pw> – owner only\n"
-        "/status – show info"
-    )
-
-def status_handler(update, context):
-    owner = data.get("owner_id")
-    allowed = data.get("allowed", [])
-    uid = update.effective_user.id
-    update.message.reply_text(
-        f"Owner: {owner or 'Not set'}\n"
-        f"Registered users: {len(allowed)}\n"
-        f"You registered: {'Yes' if uid in allowed else 'No'}"
-    )
-
-def setpass_handler(update, context):
-    if "owner_id" in data:
-        update.message.reply_text("Password already set.")
-        return
-    if not context.args:
-        update.message.reply_text("Usage: /setpass <password>")
-        return
-    pw = " ".join(context.args)
-    set_owner(update.effective_user.id, pw)
-    update.message.reply_text("Password set. You are now the owner.")
-
-@owner_only
-def changepass_handler(update, context):
-    if not context.args:
-        update.message.reply_text("Usage: /changepass <password>")
-        return
-    pw = " ".join(context.args)
-    change_password(pw)
-    update.message.reply_text("Password changed.")
-
-def register_handler(update, context):
-    if "password_hash" not in data:
-        update.message.reply_text("Owner must set password first.")
-        return
-    if not context.args:
-        update.message.reply_text("Usage: /register <password>")
-        return
-    pw = " ".join(context.args)
-    if check_password(pw):
-        add_allowed(update.effective_user.id)
-        update.message.reply_text("Registered.")
-    else:
-        update.message.reply_text("Wrong password.")
-
-def generate_handler(update, context):
-    uid = update.effective_user.id
-    if not is_allowed(uid):
-        update.message.reply_text("Not registered.")
-        return
-    if not context.args:
-        update.message.reply_text("Usage: /generate <prompt>")
-        return
-
-    prompt = " ".join(context.args)
-    m = update.message.reply_text("Generating...")
-
-    try:
-        result = call_veo2_api(prompt)
     except Exception as e:
-        m.edit_text(f"Error: {e}")
-        return
+        logging.error(f"API Error: {e}")
+        return "Sorry, I couldn't process that request."
 
-    if result.get("image_bytes"):
-        bio = BytesIO(result["image_bytes"])
-        bio.name = "image.png"
-        update.message.reply_photo(photo=InputFile(bio), caption="Done.")
-        m.delete()
-        return
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Hello! I am your AI Moderator powered by Llama. Send me a message!")
 
-    if result.get("image_url"):
-        update.message.reply_photo(photo=result["image_url"], caption="Done.")
-        m.delete()
-        return
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    
+    # Notify user the bot is "typing"
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+    
+    # Run the synchronous http.client code in a separate thread to avoid blocking
+    loop = asyncio.get_running_loop()
+    response_text = await loop.run_in_executor(None, get_llama_response, user_text)
+    
+    await update.message.reply_text(response_text)
 
-    m.edit_text("Unknown API response.")
-
-def unknown(update, context):
-    update.message.reply_text("Unknown command. Try /start.")
-
-# === Main ===
-def main():
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN missing.")
-        return
-
-    updater = Updater(BOT_TOKEN)
-    dp = updater.dispatcher
-
-    dp.add_handler(CommandHandler("start", start_handler))
-    dp.add_handler(CommandHandler("status", status_handler))
-    dp.add_handler(CommandHandler("setpass", setpass_handler))
-    dp.add_handler(CommandHandler("changepass", changepass_handler))
-    dp.add_handler(CommandHandler("register", register_handler))
-    dp.add_handler(CommandHandler("generate", generate_handler))
-
-    dp.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown))
-
-    logger.info("Bot running...")
-    updater.start_polling()
-    updater.idle()
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    # 1. Start the keep_alive server (Flask)
+    keep_alive()
+    
+    # 2. Start the Telegram Bot
+    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    
+    start_handler = CommandHandler('start', start)
+    echo_handler = MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message)
+    
+    application.add_handler(start_handler)
+    application.add_handler(echo_handler)
+    
+    print("Bot is running...")
+    application.run_polling()
