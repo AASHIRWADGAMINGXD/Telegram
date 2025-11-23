@@ -1,272 +1,221 @@
-import os
-import telebot
-import time
-from telebot import types
-from flask import Flask
-from threading import Thread
+import logging
+import asyncio
+import re
+from datetime import datetime, timedelta
+from telegram import ChatPermissions, Update
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
+from telegram.constants import ChatMemberStatus
+from keep_alive import keep_alive
 
-# --- CONFIGURATION ---
-# Get token from Environment Variable (Set this in Render)
-API_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-
-if not API_TOKEN:
-    raise ValueError("No BOT TOKEN found in environment variables!")
-
-bot = telebot.TeleBot(API_TOKEN)
-
-# --- KEEP ALIVE SERVER (For Render) ---
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "I am alive and running!"
-
-def run_http():
-    # Render assigns a PORT env var, default to 8080 if not found
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
-
-def keep_alive():
-    t = Thread(target=run_http)
-    t.start()
+# Enable logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
 # --- HELPER FUNCTIONS ---
 
-def is_admin(message):
-    """Checks if the user matches admin rights"""
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    member = bot.get_chat_member(chat_id, user_id)
-    return member.status in ['administrator', 'creator']
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Checks if the user issuing the command is an admin."""
+    user = update.effective_user
+    chat = update.effective_chat
+    member = await chat.get_member(user.id)
+    return member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
 
-def get_target(message):
-    """Gets the target user from a reply"""
-    if message.reply_to_message:
-        return message.reply_to_message.from_user
+def get_target_user(update: Update):
+    """Extracts the target user from a reply or argument."""
+    if update.message.reply_to_message:
+        return update.message.reply_to_message.from_user
     return None
 
 # --- MODERATION COMMANDS ---
 
-@bot.message_handler(commands=['kick'])
-def kick_user(message):
-    if not is_admin(message):
-        return bot.reply_to(message, "❌ You are not an admin.")
-    
-    target = get_target(message)
-    if not target:
-        return bot.reply_to(message, "❌ Reply to a user to kick them.")
+async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context): return
+    target = get_target_user(update)
+    if target:
+        await update.effective_chat.unban_member(target.id) # Kick = Unban (removes user but allows rejoin)
+        await update.message.reply_text(f"👢 Kicked {target.first_name}.")
+    else:
+        await update.message.reply_text("Reply to a user to kick them.")
 
-    try:
-        bot.unban_chat_member(message.chat.id, target.id) # Unban kicks the user but allows rejoin
-        bot.reply_to(message, f"✅ {target.first_name} has been kicked.")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {e}")
+async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context): return
+    target = get_target_user(update)
+    if target:
+        await update.effective_chat.ban_member(target.id)
+        await update.message.reply_text(f"🔨 Banned {target.first_name}.")
+    else:
+        await update.message.reply_text("Reply to a user to ban them.")
 
-@bot.message_handler(commands=['ban'])
-def ban_user(message):
-    if not is_admin(message):
-        return bot.reply_to(message, "❌ You are not an admin.")
-    
-    target = get_target(message)
-    if not target:
-        return bot.reply_to(message, "❌ Reply to a user to ban them.")
+async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context): return
+    target = get_target_user(update)
+    if target:
+        # Restrict permissions to effectively mute
+        mute_permissions = ChatPermissions(can_send_messages=False)
+        await update.effective_chat.restrict_member(target.id, permissions=mute_permissions)
+        await update.message.reply_text(f"cw Muted {target.first_name}.")
+    else:
+        await update.message.reply_text("Reply to a user to mute them.")
 
-    try:
-        bot.ban_chat_member(message.chat.id, target.id)
-        bot.reply_to(message, f"⛔ {target.first_name} has been banned.")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {e}")
-
-@bot.message_handler(commands=['mute'])
-def mute_user(message):
-    """Usage: /mute [seconds] (Reply to user)"""
-    if not is_admin(message):
-        return bot.reply_to(message, "❌ You are not an admin.")
-    
-    target = get_target(message)
-    if not target:
-        return bot.reply_to(message, "❌ Reply to a user to mute them.")
-
-    args = message.text.split()
-    duration = 60 # Default 60 seconds
-    if len(args) > 1:
-        try:
-            duration = int(args[1])
-        except ValueError:
-            return bot.reply_to(message, "❌ Time must be a number (in seconds).")
-
-    try:
-        # Restrict permissions
-        bot.restrict_chat_member(
-            message.chat.id, 
-            target.id, 
-            until_date=time.time() + duration,
-            can_send_messages=False
-        )
-        bot.reply_to(message, f"😶 {target.first_name} muted for {duration} seconds.")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {e}")
-
-@bot.message_handler(commands=['unmute'])
-def unmute_user(message):
-    if not is_admin(message):
-        return bot.reply_to(message, "❌ You are not an admin.")
-    
-    target = get_target(message)
-    if not target:
-        return bot.reply_to(message, "❌ Reply to a user to unmute.")
-
-    try:
-        # Restore permissions (Default user permissions)
-        bot.restrict_chat_member(
-            message.chat.id,
-            target.id,
+async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context): return
+    target = get_target_user(update)
+    if target:
+        # Restore default permissions (adjust as needed for your group)
+        unmute_permissions = ChatPermissions(
             can_send_messages=True,
             can_send_media_messages=True,
             can_send_other_messages=True,
             can_add_web_page_previews=True
         )
-        bot.reply_to(message, f"🗣️ {target.first_name} has been unmuted.")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {e}")
+        await update.effective_chat.restrict_member(target.id, permissions=unmute_permissions)
+        await update.message.reply_text(f"🔊 Unmuted {target.first_name}.")
+    else:
+        await update.message.reply_text("Reply to a user to unmute them.")
 
-@bot.message_handler(commands=['clear', 'purge'])
-def clear_messages(message):
-    """Usage: /clear [amount]"""
-    if not is_admin(message):
-        return bot.reply_to(message, "❌ You are not an admin.")
-
-    args = message.text.split()
-    if len(args) < 2:
-        return bot.reply_to(message, "⚠️ Usage: /clear [amount]")
-
-    try:
-        amount = int(args[1])
-        if amount > 100:
-            amount = 100 # Telegram limit per request
-            
-        # Delete current message first
-        try:
-            bot.delete_message(message.chat.id, message.message_id)
-        except:
-            pass
-
-        # Iterate backward to delete
-        message_ids = []
-        start_id = message.message_id - 1
-        for i in range(amount):
-            message_ids.append(start_id - i)
-        
-        # Note: delete_messages (batch) is supported in newer APIs, 
-        # but looping delete_message is safer for general compatibility
-        deleted_count = 0
-        for msg_id in message_ids:
-            try:
-                bot.delete_message(message.chat.id, msg_id)
-                deleted_count += 1
-            except:
-                pass # Message might not exist or is too old
-        
-        confirmation = bot.send_message(message.chat.id, f"🧹 Cleared {deleted_count} messages.")
-        time.sleep(3)
-        bot.delete_message(message.chat.id, confirmation.message_id)
-
-    except ValueError:
-        bot.reply_to(message, "❌ Please enter a valid number.")
-
-@bot.message_handler(commands=['undo_clear'])
-def undo_clear(message):
-    bot.reply_to(message, "⚠️ **System Limitations:**\nTelegram API does NOT allow restoring deleted messages. Once cleared, they are gone forever.")
-
-@bot.message_handler(commands=['promote'])
-def promote_user(message):
-    if not is_admin(message):
-        return bot.reply_to(message, "❌ You are not an admin.")
+async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Deletes X messages.
+    Usage: /clear 10
+    """
+    if not await is_admin(update, context): return
     
-    target = get_target(message)
-    if not target:
-        return bot.reply_to(message, "❌ Reply to a user to promote.")
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /clear <number>")
+        return
 
     try:
-        bot.promote_chat_member(
-            message.chat.id,
+        amount = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Please provide a valid number.")
+        return
+
+    # Telegram API constraint: Cannot delete messages older than 48h.
+    # We delete the command message itself + 'amount' previous messages.
+    message_id = update.message.message_id
+    chat_id = update.effective_chat.id
+    
+    deleted_count = 0
+    # Simple loop to delete messages going backwards
+    # Note: Bulk delete is not fully supported in bots API for all messages, we iterate.
+    for i in range(amount + 1): 
+        try:
+            await context.bot.delete_message(chat_id, message_id - i)
+            deleted_count += 1
+        except Exception:
+            continue
+    
+    confirm_msg = await context.bot.send_message(chat_id, f"🗑 Cleared {deleted_count - 1} messages.")
+    # Auto-delete confirmation after 3 seconds
+    await asyncio.sleep(3)
+    try:
+        await context.bot.delete_message(chat_id, confirm_msg.message_id)
+    except:
+        pass
+
+async def clear_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "❌ **Impossible**: Telegram API does not allow restoring deleted messages. Once deleted, they are gone forever."
+    , parse_mode='Markdown')
+
+async def promote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context): return
+    target = get_target_user(update)
+    if target:
+        await update.effective_chat.promote_member(
             target.id,
-            can_change_info=True,
-            can_post_messages=True,
-            can_edit_messages=True,
+            can_manage_chat=True,
             can_delete_messages=True,
             can_invite_users=True,
             can_restrict_members=True,
             can_pin_messages=True,
-            can_promote_members=False
+            can_promote_members=False,
+            can_manage_video_chats=True
         )
-        bot.reply_to(message, f"🌟 {target.first_name} is now an Admin.")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {e}")
+        await update.message.reply_text(f"⭐ Promoted {target.first_name} to Admin.")
+    else:
+        await update.message.reply_text("Reply to a user to promote them.")
 
-@bot.message_handler(commands=['demote'])
-def demote_user(message):
-    if not is_admin(message):
-        return bot.reply_to(message, "❌ You are not an admin.")
-    
-    target = get_target(message)
-    if not target:
-        return bot.reply_to(message, "❌ Reply to a user to demote.")
-
-    try:
-        bot.promote_chat_member(
-            message.chat.id,
+async def demote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context): return
+    target = get_target_user(update)
+    if target:
+        await update.effective_chat.promote_member(
             target.id,
-            can_change_info=False,
-            can_post_messages=False,
-            can_edit_messages=False,
+            can_manage_chat=False,
             can_delete_messages=False,
             can_invite_users=False,
             can_restrict_members=False,
             can_pin_messages=False,
-            can_promote_members=False
+            can_promote_members=False,
+            can_manage_video_chats=False
         )
-        bot.reply_to(message, f"📉 {target.first_name} is no longer an Admin.")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {e}")
+        await update.message.reply_text(f"📉 Demoted {target.first_name}.")
+    else:
+        await update.message.reply_text("Reply to a user to demote them.")
 
-@bot.message_handler(commands=['invite'])
-def create_invite(message):
-    """Usage: /invite [uses] [seconds_valid]"""
-    if not is_admin(message):
-        return bot.reply_to(message, "❌ You are not an admin.")
+async def invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Creates a custom invite link.
+    Usage: /invite limit=1 time=30m
+    """
+    if not await is_admin(update, context): return
+
+    limit = 0 # Unlimited by default
+    expire_seconds = 0 # Never expires by default
     
-    args = message.text.split()
-    uses = 1
-    duration = 0 # 0 means no expiry
+    # Parse arguments
+    for arg in context.args:
+        if arg.startswith("limit="):
+            limit = int(arg.split("=")[1])
+        elif arg.startswith("time="):
+            t_str = arg.split("=")[1]
+            if 'm' in t_str:
+                expire_seconds = int(t_str.replace('m', '')) * 60
+            elif 'h' in t_str:
+                expire_seconds = int(t_str.replace('h', '')) * 3600
+            elif 'd' in t_str:
+                expire_seconds = int(t_str.replace('d', '')) * 86400
 
-    if len(args) > 1:
-        try:
-            uses = int(args[1])
-        except: pass
-    if len(args) > 2:
-        try:
-            duration = int(args[2])
-        except: pass
-
+    expire_date = datetime.now() + timedelta(seconds=expire_seconds) if expire_seconds > 0 else None
+    
     try:
-        link = bot.create_chat_invite_link(
-            message.chat.id, 
-            member_limit=uses, 
-            expire_date=int(time.time()) + duration if duration > 0 else None
+        link = await update.effective_chat.create_invite_link(
+            member_limit=limit if limit > 0 else None,
+            expire_date=expire_date
         )
         
-        text = f"🎫 **Custom Invite Link Created**\n"
-        text += f"🔗 Link: {link.invite_link}\n"
-        text += f"👥 Limit: {uses} uses\n"
-        text += f"⏳ Expires: {duration if duration > 0 else 'Never'}"
+        msg = f"🔗 **New Invite Link**\n\nLink: {link.invite_link}"
+        if limit > 0: msg += f"\nUsers: {limit}"
+        if expire_seconds > 0: msg += f"\nExpires: in {int(expire_seconds/60)} mins"
         
-        bot.reply_to(message, text, parse_mode="Markdown")
+        await update.message.reply_text(msg, parse_mode='Markdown')
     except Exception as e:
-        bot.reply_to(message, f"❌ Error: {e}")
+        await update.message.reply_text(f"Error creating link: {e}")
 
-# --- START POLLING ---
-if __name__ == "__main__":
-    keep_alive() # Start Flask server
+# --- MAIN CONFIG ---
+
+if __name__ == '__main__':
+    # REPLACE 'YOUR_BOT_TOKEN' WITH YOUR ACTUAL TOKEN DIRECTLY OR USE OS.ENVIRON
+    import os
+    TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+
+    keep_alive() # Start the web server to keep Render awake
+
+    application = ApplicationBuilder().token(TOKEN).build()
+
+    application.add_handler(CommandHandler("kick", kick))
+    application.add_handler(CommandHandler("ban", ban))
+    application.add_handler(CommandHandler("mute", mute))
+    application.add_handler(CommandHandler("unmute", unmute))
+    application.add_handler(CommandHandler("clear", clear))
+    application.add_handler(CommandHandler("undo", clear_undo)) # Handler for 'clear undo' request
+    application.add_handler(CommandHandler("promote", promote))
+    application.add_handler(CommandHandler("demote", demote)) # Assuming 'deprompt' meant demote
+    application.add_handler(CommandHandler("invite", invite))
+
     print("Bot is running...")
-    bot.infinity_polling()
+    application.run_polling()
