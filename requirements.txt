@@ -1,4 +1,3 @@
-python-telegram-bot[job-queue]
+pyTelegramBotAPI 
+google-genai 
 flask
-requests
-google-generativeai>=0.7.2
