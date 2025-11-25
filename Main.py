@@ -156,9 +156,9 @@ async def anti_thala_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if current_count == 3:
             await update.message.reply_text("🛑 You thala limit reached")
         
-        # Optional: If they continue (count > 3), we do nothing (or you can delete their msg)
-        # if current_count > 3:
-        #    await update.message.delete()
+         If they continue (count > 3), we do nothing (or you can delete their msg)
+        if current_count > 3:
+          await update.message.delete()
 
 # --- MAIN ---
 
