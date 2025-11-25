@@ -6,8 +6,8 @@ from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Messa
 from keep_alive import keep_alive
 
 # --- CONFIGURATION ---
-TOKEN = "8578532543:AAE-r1vXUkNPVmIIDuMRz1oFhAg9GY0UQH4"  # ⚠️ REPLACE THIS WITH YOUR TELEGRAM BOT TOKEN
-GEMINI_API_KEY = "AIzaSyAjUI-SgoHBIiXH8TasuA8dTq4F7A_6LuI" # Your provided API Key
+TOKEN = "8578532543:AAE-r1vXUkNPVmIIDuMRz1oFhAg9GY0UQH4"  # ⚠️ REPLACE THIS
+GEMINI_API_KEY = "AIzaSyAjUI-SgoHBIiXH8TasuA8dTq4F7A_6LuI"
 
 # --- SETUP ---
 logging.basicConfig(
@@ -17,7 +17,12 @@ logging.basicConfig(
 
 # Configure Google Gemini AI
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+
+# Try using the specific version name, usually fixes the 404 error
+try:
+    model = genai.GenerativeModel('gemini-1.5-flash-001')
+except:
+    model = genai.GenerativeModel('gemini-pro') # Fallback to older model
 
 # Dictionary to track 'Thala' counts: {user_id: count}
 thala_counts = {}
@@ -112,7 +117,7 @@ async def clear_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("⚠️ Please provide a valid number.")
 
-# --- AI FEATURE (Updated with your API) ---
+# --- AI FEATURE (Fixed) ---
 
 async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Queries Google Gemini AI."""
@@ -124,18 +129,28 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text("🤔 Thinking...")
 
     try:
-        # Send request to Gemini
-        response = model.generate_content(user_query)
+        # Use asyncio.to_thread to prevent blocking the bot
+        response = await asyncio.to_thread(model.generate_content, user_query)
         ai_text = response.text
         
-        # Telegram has a message limit, split if too long
         if len(ai_text) > 4000:
             ai_text = ai_text[:4000] + "..."
 
         await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=ai_text, parse_mode='Markdown')
     
     except Exception as e:
-        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=f"❌ API Error: {e}")
+        error_msg = str(e)
+        # Fallback if 1.5 fails, try 'gemini-pro' on the fly
+        if "404" in error_msg or "not found" in error_msg:
+            try:
+                fallback_model = genai.GenerativeModel('gemini-pro')
+                response = await asyncio.to_thread(fallback_model.generate_content, user_query)
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=response.text, parse_mode='Markdown')
+                return
+            except Exception:
+                pass
+        
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=f"❌ Error: {error_msg}")
 
 # --- THALA CHECKER ---
 
@@ -147,36 +162,25 @@ async def anti_thala_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE)
     text = update.message.text.lower()
     user_id = update.effective_user.id
     
-    # Check if message contains "thala"
     if "thala" in text:
         current_count = thala_counts.get(user_id, 0) + 1
         thala_counts[user_id] = current_count
 
-        # Logic: Only send message when they hit exactly 3
         if current_count == 3:
             await update.message.reply_text("🛑 You thala limit reached")
-        
-         If they continue (count > 3), we do nothing (or you can delete their msg)
-        if current_count > 3:
-          await update.message.delete()
 
 # --- MAIN ---
 
 if __name__ == '__main__':
-    keep_alive() # Start Web Server
+    keep_alive()
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Admin Commands
     app.add_handler(CommandHandler("mute", mute_user))
     app.add_handler(CommandHandler("unmute", unmute_user))
     app.add_handler(CommandHandler("admin", promote_user))
     app.add_handler(CommandHandler("demote", demote_user))
     app.add_handler(CommandHandler("clear", clear_messages))
-    
-    # AI Command
     app.add_handler(CommandHandler("ask", ask_command))
-    
-    # Message Monitor (Anti-Thala) - No longer filters spam
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), anti_thala_monitor))
 
     print("Bot is running...")
