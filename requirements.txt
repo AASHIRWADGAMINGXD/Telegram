@@ -1,3 +1,4 @@
-pyTelegramBotAPI 
-google-genai 
+python-telegram-bot
+google-genai
 flask
+tornado
