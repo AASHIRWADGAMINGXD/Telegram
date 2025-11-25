@@ -6,7 +6,7 @@ from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Messa
 from keep_alive import keep_alive
 
 # --- CONFIGURATION ---
-TOKEN = "YOUR_BOT_TOKEN_HERE"  # ⚠️ REPLACE THIS WITH YOUR TELEGRAM BOT TOKEN
+TOKEN = "8578532543:AAE-r1vXUkNPVmIIDuMRz1oFhAg9GY0UQH4"  # ⚠️ REPLACE THIS WITH YOUR TELEGRAM BOT TOKEN
 GEMINI_API_KEY = "AIzaSyAjUI-SgoHBIiXH8TasuA8dTq4F7A_6LuI" # Your provided API Key
 
 # --- SETUP ---
