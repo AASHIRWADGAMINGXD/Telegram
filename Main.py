@@ -1,236 +1,281 @@
-import telebot
-import time
-import threading
-from flask import Flask
-from google import genai
-from telebot import types
+import logging
+from telegram import (
+    Update, ChatPermissions, InlineKeyboardButton,
+    InlineKeyboardMarkup
+)
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler,
+    MessageHandler, CallbackQueryHandler, ContextTypes,
+    filters
+)
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
-# Replace these with your NEW, SECURE keys
-GOOGLE_API_KEY = "AIzaSyB9UTpO26FD5ErSJbpsKe-W3gJpFV9HcVs" 
-BOT_TOKEN = "8578532543:AAE-r1vXUkNPVmIIDuMRz1oFhAg9GY0UQH4"
+logging.basicConfig(level=logging.INFO)
 
-# Initialize Google AI Client
-# Note: Ensure you use a valid model name. "gemini-1.5-flash" is the current standard.
-client = genai.Client(api_key=GOOGLE_API_KEY)
+TOKEN = "8578532543:AAE-r1vXUkNPVmIIDuMRz1oFhAg9GY0UQH4"
 
-# Initialize Telegram Bot
-bot = telebot.TeleBot(BOT_TOKEN)
+AFK_USERS = {}  # {user_id: reason}
 
-# AFK Storage
-afk_users = {}
 
-# ==========================================
-# KEEP ALIVE SERVER
-# ==========================================
-app = Flask(__name__)
+# ---------------------------
+# Auto AFK detection
+# ---------------------------
+async def message_detector(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
 
-@app.route('/')
-def home():
-    return "I am alive"
+    if user_id in AFK_USERS:
+        del AFK_USERS[user_id]
+        await update.message.reply_text(f"{update.effective_user.first_name} is back.")
 
-def run_web_server():
-    app.run(host='0.0.0.0', port=8080)
 
-def keep_alive():
-    t = threading.Thread(target=run_web_server)
-    t.start()
+# ---------------------------
+# /afk
+# ---------------------------
+async def afk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    reason = " ".join(context.args) if context.args else "Away"
 
-# ==========================================
-# HELPER FUNCTIONS
-# ==========================================
-def is_admin(message):
-    """Check if the user triggering the command is an admin."""
-    try:
-        chat_member = bot.get_chat_member(message.chat.id, message.from_user.id)
-        return chat_member.status in ['administrator', 'creator']
-    except Exception:
-        return False
+    AFK_USERS[user.id] = reason
+    await update.message.reply_text(f"{user.first_name} is AFK. Reason: {reason}")
 
-# ==========================================
-# BOT COMMANDS
-# ==========================================
 
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    help_text = (
-        "🤖 **Bot Commands:**\n\n"
-        "**AI:**\n"
-        "`/ask <query>` - Ask Google Gemini AI a question.\n\n"
-        "**Moderation (Admins):**\n"
-        "`/clear <number>` - Delete X messages.\n"
-        "`/mute` - Mute a user (reply to them).\n"
-        "`/admin` - Promote a user to full admin (reply to them).\n"
-        "`/demote` - Demote an admin (reply to them).\n\n"
-        "**Utility:**\n"
-        "`/afk <reason>` - Set yourself as AFK.\n"
-        "`/afkclear` - Remove AFK status.\n"
+# ---------------------------
+# Helper: Get admin list
+# ---------------------------
+async def admin_ids(update):
+    admins = await update.effective_chat.get_administrators()
+    return [a.user.id for a in admins]
+
+
+# ---------------------------
+# /clear
+# ---------------------------
+async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in await admin_ids(update):
+        return
+
+    chat = update.effective_chat
+    async for msg in context.bot.get_chat_history(chat.id, limit=200):
+        try:
+            await context.bot.delete_message(chat.id, msg.message_id)
+        except:
+            pass
+
+    await update.message.reply_text("Chat cleared.")
+
+
+# ---------------------------
+# MUTE USER
+# ---------------------------
+async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in await admin_ids(update):
+        return
+
+    if not update.message.reply_to_message:
+        return await update.message.reply_text("Reply to a message to mute.")
+
+    target = update.message.reply_to_message.from_user.id
+
+    await context.bot.restrict_chat_member(
+        update.effective_chat.id,
+        target,
+        ChatPermissions(can_send_messages=False)
     )
-    bot.reply_to(message, help_text, parse_mode='Markdown')
+    await update.message.reply_text("User muted.")
 
-# --- AI COMMAND ---
-@bot.message_handler(commands=['ask'])
-def ask_ai(message):
-    try:
-        # Extract prompt
-        prompt = message.text[len('/ask '):].strip()
-        if not prompt:
-            bot.reply_to(message, "Please provide a question. Example: `/ask How does AI work?`", parse_mode='Markdown')
-            return
 
-        sent_msg = bot.reply_to(message, "🤔 Thinking...")
-
-        # Call Google Gemini
-        response = client.models.generate_content(
-            model="gemini-1.5-flash", 
-            contents=prompt
-        )
-
-        # Telegram has a 4096 character limit per message. Split if necessary.
-        response_text = response.text
-        if len(response_text) > 4000:
-            for x in range(0, len(response_text), 4000):
-                bot.reply_to(message, response_text[x:x+4000])
-        else:
-            bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=response_text, parse_mode='Markdown')
-
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {str(e)}")
-
-# --- MODERATION COMMANDS ---
-@bot.message_handler(commands=['clear'])
-def clear_messages(message):
-    if not is_admin(message):
-        bot.reply_to(message, "❌ You must be an admin to use this.")
+# ---------------------------
+# UNMUTE
+# ---------------------------
+async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in await admin_ids(update):
         return
 
-    try:
-        args = message.text.split()
-        if len(args) < 2:
-            count = 1  # Default to 1 if no number provided
-        else:
-            count = int(args[1])
+    if not update.message.reply_to_message:
+        return await update.message.reply_text("Reply to unmute.")
 
-        bot.delete_message(message.chat.id, message.message_id) # Delete the command itself
-        
-        # Delete previous messages
-        for i in range(count):
+    target = update.message.reply_to_message.from_user.id
+
+    await context.bot.restrict_chat_member(
+        update.effective_chat.id,
+        target,
+        ChatPermissions(can_send_messages=True)
+    )
+
+    await update.message.reply_text("User unmuted.")
+
+
+# ---------------------------
+# PROMOTE
+# ---------------------------
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in await admin_ids(update):
+        return
+
+    if not update.message.reply_to_message:
+        return await update.message.reply_text("Reply to promote user.")
+
+    target = update.message.reply_to_message.from_user.id
+
+    await context.bot.promote_chat_member(
+        update.effective_chat.id,
+        target,
+        can_delete_messages=True,
+        can_manage_chat=True,
+        can_restrict_members=True
+    )
+    await update.message.reply_text("User promoted to admin.")
+
+
+# ---------------------------
+# DEMOTE
+# ---------------------------
+async def demote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in await admin_ids(update):
+        return
+
+    if not update.message.reply_to_message:
+        return await update.message.reply_text("Reply to demote user.")
+
+    target = update.message.reply_to_message.from_user.id
+
+    await context.bot.promote_chat_member(
+        update.effective_chat.id,
+        target,
+        can_delete_messages=False,
+        can_manage_chat=False,
+        can_restrict_members=False
+    )
+    await update.message.reply_text("User demoted.")
+
+
+# ---------------------------
+# BALA GIF
+# ---------------------------
+async def bala(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    gif = "https://media.tenor.com/kacrQ4PzNl4AAAAM/bala.gif"
+    await update.message.reply_animation(gif)
+
+
+# ---------------------------
+# AI Ask (mock)
+# ---------------------------
+async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(context.args)
+    if not text:
+        return await update.message.reply_text("Write: /ask something")
+
+    await update.message.reply_text(f"AI: {text}")
+
+
+# ---------------------------
+# ADMIN PANEL (INLINE BUTTONS)
+# ---------------------------
+async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in await admin_ids(update):
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("Clear Chat", callback_data="panel_clear")],
+        [
+            InlineKeyboardButton("Mute", callback_data="panel_mute"),
+            InlineKeyboardButton("Unmute", callback_data="panel_unmute")
+        ],
+        [
+            InlineKeyboardButton("Promote", callback_data="panel_promote"),
+            InlineKeyboardButton("Demote", callback_data="panel_demote")
+        ]
+    ]
+
+    await update.message.reply_text(
+        "Admin panel:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+# ---------------------------
+# PANEL HANDLER
+# ---------------------------
+async def panel_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat = query.message.chat
+
+    try:
+        msg = (await context.bot.get_chat_history(chat.id, limit=2))[1]
+        target = msg.from_user.id
+    except:
+        return await query.edit_message_text("Action failed. Reply to a user first.")
+
+    if query.data == "panel_clear":
+        async for m in context.bot.get_chat_history(chat.id, limit=200):
             try:
-                bot.delete_message(message.chat.id, message.message_id - (i + 1))
+                await context.bot.delete_message(chat.id, m.message_id)
             except:
-                pass # Skip if message too old or already deleted
-                
-        bot.send_message(message.chat.id, f"🧹 Cleared {count} messages.")
-    except Exception as e:
-        bot.reply_to(message, "❌ Error clearing messages. Make sure I have 'Delete Messages' permission.")
+                pass
+        return await query.edit_message_text("Chat cleared.")
 
-@bot.message_handler(commands=['mute'])
-def mute_user(message):
-    if not is_admin(message):
-        return
-    
-    if not message.reply_to_message:
-        bot.reply_to(message, "Please reply to the user you want to mute.")
-        return
-
-    try:
-        user_id = message.reply_to_message.from_user.id
-        # Mute indefinitely (until manual unmute)
-        bot.restrict_chat_member(message.chat.id, user_id, can_send_messages=False)
-        bot.reply_to(message, f"🔇 Muted {message.reply_to_message.from_user.first_name}.")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {e}")
-
-@bot.message_handler(commands=['admin'])
-def promote_user(message):
-    # Security: Only Creator/Admins should run this
-    if not is_admin(message):
-        return
-
-    if not message.reply_to_message:
-        bot.reply_to(message, "Please reply to the user you want to promote.")
-        return
-
-    try:
-        user_id = message.reply_to_message.from_user.id
-        bot.promote_chat_member(
-            message.chat.id, user_id,
-            can_change_info=True, can_post_messages=True,
-            can_edit_messages=True, can_delete_messages=True,
-            can_invite_users=True, can_restrict_members=True,
-            can_pin_messages=True, can_promote_members=True
+    if query.data == "panel_mute":
+        await context.bot.restrict_chat_member(
+            chat.id,
+            target,
+            ChatPermissions(can_send_messages=False)
         )
-        bot.reply_to(message, f"👑 {message.reply_to_message.from_user.first_name} is now an Admin with full permissions.")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {e}")
+        return await query.edit_message_text("User muted.")
 
-@bot.message_handler(commands=['demote'])
-def demote_user(message):
-    if not is_admin(message):
-        return
-
-    if not message.reply_to_message:
-        bot.reply_to(message, "Please reply to the user you want to demote.")
-        return
-
-    try:
-        user_id = message.reply_to_message.from_user.id
-        bot.promote_chat_member(
-            message.chat.id, user_id,
-            can_change_info=False, can_post_messages=False,
-            can_edit_messages=False, can_delete_messages=False,
-            can_invite_users=False, can_restrict_members=False,
-            can_pin_messages=False, can_promote_members=False
+    if query.data == "panel_unmute":
+        await context.bot.restrict_chat_member(
+            chat.id,
+            target,
+            ChatPermissions(can_send_messages=True)
         )
-        bot.reply_to(message, f"📉 {message.reply_to_message.from_user.first_name} has been demoted.")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {e}")
+        return await query.edit_message_text("User unmuted.")
 
-# --- AFK SYSTEM ---
-@bot.message_handler(commands=['afk'])
-def set_afk(message):
-    user_id = message.from_user.id
-    reason = message.text[len('/afk '):].strip()
-    if not reason:
-        reason = "No reason provided"
-    
-    afk_users[user_id] = reason
-    bot.reply_to(message, f"💤 You are now AFK.\nReason: {reason}")
+    if query.data == "panel_promote":
+        await context.bot.promote_chat_member(
+            chat.id,
+            target,
+            can_delete_messages=True,
+            can_manage_chat=True,
+            can_restrict_members=True
+        )
+        return await query.edit_message_text("User promoted.")
 
-@bot.message_handler(commands=['afkclear'])
-def clear_afk_command(message):
-    user_id = message.from_user.id
-    if user_id in afk_users:
-        del afk_users[user_id]
-        bot.reply_to(message, "👋 Welcome back! AFK status removed.")
-    else:
-        bot.reply_to(message, "You were not AFK.")
+    if query.data == "panel_demote":
+        await context.bot.promote_chat_member(
+            chat.id,
+            target,
+            can_delete_messages=False,
+            can_manage_chat=False,
+            can_restrict_members=False
+        )
+        return await query.edit_message_text("User demoted.")
 
-# AFK Logic: Listen to all messages
-@bot.message_handler(func=lambda message: True)
-def check_afk(message):
-    user_id = message.from_user.id
-    
-    # 1. If an AFK user speaks, remove their AFK status automatically
-    if user_id in afk_users:
-        del afk_users[user_id]
-        bot.reply_to(message, f"👋 Welcome back {message.from_user.first_name}! I removed your AFK status.")
-        return
 
-    # 2. If someone replies to/mentions an AFK user
-    if message.reply_to_message:
-        replied_user_id = message.reply_to_message.from_user.id
-        if replied_user_id in afk_users:
-            reason = afk_users[replied_user_id]
-            bot.reply_to(message, f"🤫 {message.reply_to_message.from_user.first_name} is currently AFK.\nReason: {reason}")
+# ---------------------------
+# MAIN
+# ---------------------------
+async def main():
+    app = ApplicationBuilder().token(TOKEN).build()
 
-# ==========================================
-# MAIN LOOP
-# ==========================================
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_detector))
+
+    app.add_handler(CommandHandler("afk", afk))
+    app.add_handler(CommandHandler("clear", clear))
+    app.add_handler(CommandHandler("mute", mute))
+    app.add_handler(CommandHandler("unmute", unmute))
+    app.add_handler(CommandHandler("admin", admin))
+    app.add_handler(CommandHandler("demote", demote))
+    app.add_handler(CommandHandler("bala", bala))
+    app.add_handler(CommandHandler("ask", ask))
+    app.add_handler(CommandHandler("panel", panel))
+
+    app.add_handler(CallbackQueryHandler(panel_buttons))
+
+    print("Bot running...")
+    await app.run_polling()
+
+
 if __name__ == "__main__":
-    print("Starting Keep Alive Server...")
-    keep_alive()
-    print("Bot is running...")
-    bot.infinity_polling()
+    import asyncio
+    asyncio.run(main())
