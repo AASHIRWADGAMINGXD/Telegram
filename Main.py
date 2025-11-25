@@ -1,190 +1,236 @@
-import os
-import logging
-import asyncio
-from threading import Thread
+import telebot
+import time
+import threading
 from flask import Flask
-from telegram import Update, ChatPermissions
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from google import genai
+from telebot import types
 
-# ---------------- CONFIGURATION ---------------- #
-# Get the token from Environment Variables (Set this in Render)
-TOKEN = os.environ.get("TOKEN") 
+# ==========================================
+# CONFIGURATION
+# ==========================================
+# Replace these with your NEW, SECURE keys
+GOOGLE_API_KEY = "AIzaSyB9UTpO26FD5ErSJbpsKe-W3gJpFV9HcVs" 
+BOT_TOKEN = "8578532543:AAE-r1vXUkNPVmIIDuMRz1oFhAg9GY0UQH4"
 
-# Global dictionary to store AFK status
-# Format: {user_id: "Reason"}
-AFK_USERS = {}
+# Initialize Google AI Client
+# Note: Ensure you use a valid model name. "gemini-1.5-flash" is the current standard.
+client = genai.Client(api_key=GOOGLE_API_KEY)
 
-# ---------------- KEEP ALIVE (WEB SERVER) ---------------- #
-app = Flask('')
+# Initialize Telegram Bot
+bot = telebot.TeleBot(BOT_TOKEN)
+
+# AFK Storage
+afk_users = {}
+
+# ==========================================
+# KEEP ALIVE SERVER
+# ==========================================
+app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot is alive and running!"
+    return "I am alive"
 
-def run():
-    # Render usually assigns a port, or we default to 8080
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+def run_web_server():
+    app.run(host='0.0.0.0', port=8080)
 
 def keep_alive():
-    t = Thread(target=run)
+    t = threading.Thread(target=run_web_server)
     t.start()
 
-# ---------------- BOT COMMANDS ---------------- #
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
+def is_admin(message):
+    """Check if the user triggering the command is an admin."""
+    try:
+        chat_member = bot.get_chat_member(message.chat.id, message.from_user.id)
+        return chat_member.status in ['administrator', 'creator']
+    except Exception:
+        return False
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Bot is Online! 🚀\nCommands:\n"
-        "/bala - Send a GIF\n"
-        "/mute - Mute a user (Reply to them)\n"
-        "/clear <number> - Delete messages\n"
-        "/permission - Check user permission\n"
-        "/afk <reason> - Go AFK"
+# ==========================================
+# BOT COMMANDS
+# ==========================================
+
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    help_text = (
+        "🤖 **Bot Commands:**\n\n"
+        "**AI:**\n"
+        "`/ask <query>` - Ask Google Gemini AI a question.\n\n"
+        "**Moderation (Admins):**\n"
+        "`/clear <number>` - Delete X messages.\n"
+        "`/mute` - Mute a user (reply to them).\n"
+        "`/admin` - Promote a user to full admin (reply to them).\n"
+        "`/demote` - Demote an admin (reply to them).\n\n"
+        "**Utility:**\n"
+        "`/afk <reason>` - Set yourself as AFK.\n"
+        "`/afkclear` - Remove AFK status.\n"
     )
+    bot.reply_to(message, help_text, parse_mode='Markdown')
 
-# Feature: /bala send gif
-async def bala(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # A funny GIF URL (You can change this link)
-    gif_url = "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExcWc0aHV3emF4bmF4aHhpZnh4aHhpZnh4aHhpZnh4aHhpZnh4aHhpZiZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/LfpjDCLvC9xapD6zO8/giphy.gif"
-    await update.message.reply_animation(gif_url, caption="Bala Bala! 🕺")
-
-# Feature: /clear
-async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Check if user is admin
-    user = update.effective_user
-    chat_member = await update.effective_chat.get_member(user.id)
-    
-    if chat_member.status not in ['administrator', 'creator']:
-        await update.message.reply_text("You need Admin permissions to use this.")
-        return
-
-    # Delete the command message itself
-    await update.message.delete()
-
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /clear <number>", delete_after=5)
-        return
-
+# --- AI COMMAND ---
+@bot.message_handler(commands=['ask'])
+def ask_ai(message):
     try:
-        count = int(args[0])
-        # Note: Bots can't easily bulk delete old messages due to API limits.
-        # We will iterate and delete recent message IDs.
-        # This is a basic implementation suitable for recent messages.
-        message_id = update.message.message_id
-        for i in range(1, count + 1):
-            try:
-                await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=message_id - i)
-            except Exception:
-                continue # Skip if message doesn't exist or too old
-        
-        confirmation = await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Tried clearing {count} messages.")
-        # Delete the confirmation after 3 seconds
-        await asyncio.sleep(3)
-        await confirmation.delete()
+        # Extract prompt
+        prompt = message.text[len('/ask '):].strip()
+        if not prompt:
+            bot.reply_to(message, "Please provide a question. Example: `/ask How does AI work?`", parse_mode='Markdown')
+            return
 
-    except ValueError:
-        await update.message.reply_text("Please provide a valid number.")
+        sent_msg = bot.reply_to(message, "🤔 Thinking...")
 
-# Feature: /mute
-async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat_member = await update.effective_chat.get_member(user.id)
-    
-    # Check Admin
-    if chat_member.status not in ['administrator', 'creator']:
-        await update.message.reply_text("❌ You are not an admin!")
-        return
+        # Call Google Gemini
+        response = client.models.generate_content(
+            model="gemini-1.5-flash", 
+            contents=prompt
+        )
 
-    # Check if it's a reply
-    if not update.message.reply_to_message:
-        await update.message.reply_text("ℹ️ Reply to a user to mute them.")
-        return
+        # Telegram has a 4096 character limit per message. Split if necessary.
+        response_text = response.text
+        if len(response_text) > 4000:
+            for x in range(0, len(response_text), 4000):
+                bot.reply_to(message, response_text[x:x+4000])
+        else:
+            bot.edit_message_text(chat_id=message.chat.id, message_id=sent_msg.message_id, text=response_text, parse_mode='Markdown')
 
-    victim = update.message.reply_to_message.from_user
-    try:
-        permissions = ChatPermissions(can_send_messages=False)
-        await update.effective_chat.restrict_member(victim.id, permissions=permissions)
-        await update.message.reply_text(f"Qwiet please! 🤫 {victim.first_name} has been muted.")
     except Exception as e:
-        await update.message.reply_text(f"Failed to mute. Ensure I am Admin and the user is not. Error: {e}")
+        bot.reply_to(message, f"❌ Error: {str(e)}")
 
-# Feature: /permmision (Permission)
-async def check_permission(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat_member = await update.effective_chat.get_member(user.id)
-    status = chat_member.status.upper()
-    await update.message.reply_text(f"👤 <b>User:</b> {user.first_name}\n🔰 <b>Status:</b> {status}", parse_mode='HTML')
-
-# Feature: /afk
-async def set_afk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    reason = " ".join(context.args) if context.args else "No reason given"
-    
-    AFK_USERS[user.id] = reason
-    await update.message.reply_text(f"😴 {user.first_name} is now AFK.\nReason: {reason}")
-
-# Feature: Handle AFK Mentions and Returns
-async def afk_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.from_user:
+# --- MODERATION COMMANDS ---
+@bot.message_handler(commands=['clear'])
+def clear_messages(message):
+    if not is_admin(message):
+        bot.reply_to(message, "❌ You must be an admin to use this.")
         return
 
-    user_id = update.message.from_user.id
+    try:
+        args = message.text.split()
+        if len(args) < 2:
+            count = 1  # Default to 1 if no number provided
+        else:
+            count = int(args[1])
+
+        bot.delete_message(message.chat.id, message.message_id) # Delete the command itself
+        
+        # Delete previous messages
+        for i in range(count):
+            try:
+                bot.delete_message(message.chat.id, message.message_id - (i + 1))
+            except:
+                pass # Skip if message too old or already deleted
+                
+        bot.send_message(message.chat.id, f"🧹 Cleared {count} messages.")
+    except Exception as e:
+        bot.reply_to(message, "❌ Error clearing messages. Make sure I have 'Delete Messages' permission.")
+
+@bot.message_handler(commands=['mute'])
+def mute_user(message):
+    if not is_admin(message):
+        return
     
-    # 1. Check if the sender is returning from AFK
-    if user_id in AFK_USERS:
-        reason = AFK_USERS.pop(user_id)
-        await update.message.reply_text(f"👋 Welcome back {update.message.from_user.first_name}! You were away: {reason}")
+    if not message.reply_to_message:
+        bot.reply_to(message, "Please reply to the user you want to mute.")
+        return
 
-    # 2. Check if the message mentions an AFK user (via Reply)
-    if update.message.reply_to_message:
-        replied_user_id = update.message.reply_to_message.from_user.id
-        if replied_user_id in AFK_USERS:
-            reason = AFK_USERS[replied_user_id]
-            name = update.message.reply_to_message.from_user.first_name
-            await update.message.reply_text(f"🤫 Shh! {name} is AFK currently.\nReason: {reason}")
-            
-    # 3. Check mentions in text entities (Basic check)
-    if update.message.parse_entities(types=["mention", "text_mention"]):
-        # This is more complex in Python-Telegram-Bot, simplified here:
-        # If you need full mention support, we iterate entities. 
-        # For simplicity, we stick to reply detection above.
-        pass
+    try:
+        user_id = message.reply_to_message.from_user.id
+        # Mute indefinitely (until manual unmute)
+        bot.restrict_chat_member(message.chat.id, user_id, can_send_messages=False)
+        bot.reply_to(message, f"🔇 Muted {message.reply_to_message.from_user.first_name}.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error: {e}")
 
-# ---------------- MAIN EXECUTION ---------------- #
+@bot.message_handler(commands=['admin'])
+def promote_user(message):
+    # Security: Only Creator/Admins should run this
+    if not is_admin(message):
+        return
 
-def main():
-    # 1. Start the Web Server for Render
+    if not message.reply_to_message:
+        bot.reply_to(message, "Please reply to the user you want to promote.")
+        return
+
+    try:
+        user_id = message.reply_to_message.from_user.id
+        bot.promote_chat_member(
+            message.chat.id, user_id,
+            can_change_info=True, can_post_messages=True,
+            can_edit_messages=True, can_delete_messages=True,
+            can_invite_users=True, can_restrict_members=True,
+            can_pin_messages=True, can_promote_members=True
+        )
+        bot.reply_to(message, f"👑 {message.reply_to_message.from_user.first_name} is now an Admin with full permissions.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error: {e}")
+
+@bot.message_handler(commands=['demote'])
+def demote_user(message):
+    if not is_admin(message):
+        return
+
+    if not message.reply_to_message:
+        bot.reply_to(message, "Please reply to the user you want to demote.")
+        return
+
+    try:
+        user_id = message.reply_to_message.from_user.id
+        bot.promote_chat_member(
+            message.chat.id, user_id,
+            can_change_info=False, can_post_messages=False,
+            can_edit_messages=False, can_delete_messages=False,
+            can_invite_users=False, can_restrict_members=False,
+            can_pin_messages=False, can_promote_members=False
+        )
+        bot.reply_to(message, f"📉 {message.reply_to_message.from_user.first_name} has been demoted.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error: {e}")
+
+# --- AFK SYSTEM ---
+@bot.message_handler(commands=['afk'])
+def set_afk(message):
+    user_id = message.from_user.id
+    reason = message.text[len('/afk '):].strip()
+    if not reason:
+        reason = "No reason provided"
+    
+    afk_users[user_id] = reason
+    bot.reply_to(message, f"💤 You are now AFK.\nReason: {reason}")
+
+@bot.message_handler(commands=['afkclear'])
+def clear_afk_command(message):
+    user_id = message.from_user.id
+    if user_id in afk_users:
+        del afk_users[user_id]
+        bot.reply_to(message, "👋 Welcome back! AFK status removed.")
+    else:
+        bot.reply_to(message, "You were not AFK.")
+
+# AFK Logic: Listen to all messages
+@bot.message_handler(func=lambda message: True)
+def check_afk(message):
+    user_id = message.from_user.id
+    
+    # 1. If an AFK user speaks, remove their AFK status automatically
+    if user_id in afk_users:
+        del afk_users[user_id]
+        bot.reply_to(message, f"👋 Welcome back {message.from_user.first_name}! I removed your AFK status.")
+        return
+
+    # 2. If someone replies to/mentions an AFK user
+    if message.reply_to_message:
+        replied_user_id = message.reply_to_message.from_user.id
+        if replied_user_id in afk_users:
+            reason = afk_users[replied_user_id]
+            bot.reply_to(message, f"🤫 {message.reply_to_message.from_user.first_name} is currently AFK.\nReason: {reason}")
+
+# ==========================================
+# MAIN LOOP
+# ==========================================
+if __name__ == "__main__":
+    print("Starting Keep Alive Server...")
     keep_alive()
-
-    # 2. Check Token
-    if not TOKEN:
-        print("Error: TOKEN environment variable not set.")
-        return
-
-    # 3. Setup Bot
-    application = Application.builder().token(TOKEN).build()
-
-    # 4. Add Handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("bala", bala))
-    application.add_handler(CommandHandler("clear", clear))
-    application.add_handler(CommandHandler("mute", mute))
-    application.add_handler(CommandHandler("permission", check_permission))
-    application.add_handler(CommandHandler("afk", set_afk))
-    
-    # Message Handler for AFK logic (Must be last)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, afk_handler))
-
-    # 5. Run
     print("Bot is running...")
-    application.run_polling()
-
-if __name__ == '__main__':
-    main()
+    bot.infinity_polling()
