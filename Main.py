@@ -1,512 +1,327 @@
-import os
-import json
-import threading
+# file: bot.py
 import asyncio
-from flask import Flask, request
-from telegram import Update, ChatPermissions
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import sqlite3
+import time
+from datetime import datetime, timedelta
+import re
+from aiohttp import web  # lightweight async web server for status page
+from telegram import ChatPermissions, Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, filters
 
-app = Flask(__name__)
+API_TOKEN = "YOUR_BOT_TOKEN"
+DB = "bot.db"
+WARN_THRESHOLD = 3
 
-TOKEN = os.environ.get('TELEGRAM_TOKEN')
-if not TOKEN:
-    raise ValueError('TELEGRAM_TOKEN environment variable is required.')
+# --- DB helpers ---
+def init_db():
+    con = sqlite3.connect(DB)
+    cur = con.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS warns (
+        chat_id INTEGER, user_id INTEGER, username TEXT, reason TEXT, ts INTEGER
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS mutes (
+        chat_id INTEGER, user_id INTEGER, until_ts INTEGER
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS invites (
+        chat_id INTEGER, link TEXT, expires_at INTEGER
+    )""")
+    con.commit()
+    con.close()
 
-PORT = int(os.environ.get('PORT', 5000))
-DATA_FILE = 'data.json'
+def add_warn(chat_id, user_id, username, reason):
+    con = sqlite3.connect(DB)
+    cur = con.cursor()
+    cur.execute("INSERT INTO warns VALUES (?,?,?,?,?)",
+                (chat_id, user_id, username, reason, int(time.time())))
+    con.commit()
+    con.close()
 
-# Load persistent data
-def load_data():
+def get_warns(chat_id, user_id):
+    con = sqlite3.connect(DB)
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM warns WHERE chat_id=? AND user_id=?",
+                (chat_id, user_id))
+    (count,) = cur.fetchone()
+    con.close()
+    return count
+
+def clear_warns(chat_id, user_id, count=None):
+    con = sqlite3.connect(DB)
+    cur = con.cursor()
+    if count is None:
+        cur.execute("DELETE FROM warns WHERE chat_id=? AND user_id=?",
+                    (chat_id, user_id))
+    else:
+        # remove N oldest warnings
+        cur.execute("""DELETE FROM warns WHERE rowid IN (
+            SELECT rowid FROM warns WHERE chat_id=? AND user_id=? ORDER BY ts ASC LIMIT ?
+        )""", (chat_id, user_id, count))
+    con.commit()
+    con.close()
+
+def add_mute(chat_id, user_id, until_ts):
+    con = sqlite3.connect(DB)
+    cur = con.cursor()
+    cur.execute("REPLACE INTO mutes VALUES (?,?,?)", (chat_id, user_id, until_ts))
+    con.commit(); con.close()
+
+def remove_mute(chat_id, user_id):
+    con = sqlite3.connect(DB)
+    cur = con.cursor()
+    cur.execute("DELETE FROM mutes WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+    con.commit(); con.close()
+
+def list_mutes_expired():
+    now = int(time.time())
+    con = sqlite3.connect(DB)
+    cur = con.cursor()
+    cur.execute("SELECT chat_id, user_id FROM mutes WHERE until_ts <= ?", (now,))
+    rows = cur.fetchall()
+    con.close()
+    return rows
+
+# --- utils ---
+def is_admin(update: Update, user_id: int):
+    chat = update.effective_chat
+    if chat is None: return False
+    member = chat.get_member(user_id)
+    return member.status in ("administrator", "creator")
+
+def parse_duration(s: str) -> int:
+    """Parse duration like '10m','2h','1d' -> seconds"""
+    if not s:
+        return None
+    m = re.match(r"^(\d+)([smhd])$", s)
+    if not m: return None
+    val, unit = int(m.group(1)), m.group(2)
+    if unit == "s": return val
+    if unit == "m": return val*60
+    if unit == "h": return val*3600
+    if unit == "d": return val*86400
+
+# --- command handlers ---
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Hello — bot ready.")
+
+async def clean_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # admin-only
+    if not is_admin(update, update.effective_user.id):
+        await update.message.reply_text("Only admins can use /clean.")
+        return
     try:
-        with open(DATA_FILE, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {'settings': {}, 'warns': {}}
-
-data = load_data()
-
-def save_data():
-    with open(DATA_FILE, 'w') as f:
-        json.dump(data, f, indent=4)
-
-# Settings helpers (per chat)
-def get_setting(chat_id: int, key: str):
-    data['settings'].setdefault(chat_id, {})
-    return data['settings'][chat_id].get(key, '')
-
-def set_setting(chat_id: int, key: str, value: str):
-    data['settings'].setdefault(chat_id, {})
-    data['settings'][chat_id][key] = value
-    save_data()
-
-# Warns helpers (per chat/user)
-def get_warns(user_id: int, chat_id: int):
-    data['warns'].setdefault(chat_id, {})
-    return data['warns'][chat_id].get(user_id, 0)
-
-def set_warns(user_id: int, chat_id: int, count: int):
-    data['warns'].setdefault(chat_id, {})
-    data['warns'][chat_id][user_id] = count
-    save_data()
-
-# Bot application
-application = Application.builder().token(TOKEN).build()
-
-# Command: /start
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Hello! I am a moderator bot with 30+ features. Use /help for commands.')
-
-application.add_handler(CommandHandler("start", start))
-
-# Command: /help
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = """
-/ping - Check bot status
-/id - Your user ID
-/info [user_id] - User info
-/ban - Ban replied user
-/unban - Unban replied user
-/kick - Kick replied user
-/mute [seconds] - Mute replied user
-/unmute - Unmute replied user
-/warn [reason] - Warn replied user
-/unwarn - Remove warn from replied user
-/warns - Show warns for replied/self user
-/del - Delete replied message
-/purge [count] - Purge last N messages (default 5)
-/rules - Show group rules
-/setrules <rules> - Set group rules
-/welcome - Show welcome message
-/setwelcome <msg> - Set welcome (use {name})
-/goodbye - Show goodbye message
-/setgoodbye <msg> - Set goodbye (use {name})
-/pin - Pin replied message
-/unpin - Unpin message
-/promote - Promote replied user to admin
-/demote - Demote replied user
-/lock - Lock chat (restrict non-admins from sending messages)
-/unlock - Unlock chat
-/slowmode [seconds] - Set slow mode delay
-/stats - Group member count
-/broadcast <msg> - Send message to group
-    """
-    await update.message.reply_text(help_text)
-
-application.add_handler(CommandHandler("help", help_command))
-
-# Command: /ping
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Pong! Bot is alive.')
-
-application.add_handler(CommandHandler("ping", ping))
-
-# Command: /id
-async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await update.message.reply_text(f'Your ID: {user.id}')
-
-application.add_handler(CommandHandler("id", id_command))
-
-# Command: /info
-async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if context.args:
+        n = int(context.args[0]) if context.args else 50
+    except ValueError:
+        n = 50
+    chat = update.effective_chat
+    # fetch recent messages via get_chat_history not available — rely on message ids
+    # We'll try deleting messages in a window: last n messages before command message
+    msg_id = update.message.message_id
+    deleted = 0
+    for mid in range(msg_id-1, max(msg_id-n-1, msg_id-200), -1):
         try:
-            user_id = int(context.args[0])
-            user = await context.bot.get_chat(user_id)
-        except:
-            await update.message.reply_text('Invalid user ID.')
-            return
-    else:
-        user = update.effective_user
-    text = f"Name: {user.first_name or ''}\nID: {user.id}\nUsername: @{user.username or 'None'}"
-    await update.message.reply_text(text)
+            await context.bot.delete_message(chat.id, mid)
+            deleted += 1
+        except Exception:
+            pass
+    await update.message.reply_text(f"Attempted to delete up to {n} messages. Deleted: {deleted}")
 
-application.add_handler(CommandHandler("info", info))
-
-# Command: /ban
-async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text('Reply to a user message to ban.')
+async def mute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update, update.effective_user.id):
+        await update.message.reply_text("Only admins can mute.")
         return
-    user = update.message.reply_to_message.from_user
-    chat = update.effective_chat
-    if not await context.bot.get_chat_member(chat.id, context.bot.id).can_restrict_members:
-        await update.message.reply_text('Bot lacks ban permission.')
+    if not context.args:
+        await update.message.reply_text("Usage: /mute @username 10m")
         return
-    await context.bot.ban_chat_member(chat_id=chat.id, user_id=user.id)
-    await update.message.reply_text(f'Banned {user.first_name}.')
-
-application.add_handler(CommandHandler("ban", ban))
-
-# Command: /unban
-async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text('Reply to a user message to unban.')
-        return
-    user = update.message.reply_to_message.from_user
-    chat = update.effective_chat
-    if not await context.bot.get_chat_member(chat.id, context.bot.id).can_restrict_members:
-        await update.message.reply_text('Bot lacks unban permission.')
-        return
-    await context.bot.unban_chat_member(chat_id=chat.id, user_id=user.id)
-    await update.message.reply_text(f'Unbanned {user.first_name}.')
-
-application.add_handler(CommandHandler("unban", unban))
-
-# Command: /kick
-async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text('Reply to a user message to kick.')
-        return
-    user = update.message.reply_to_message.from_user
-    chat = update.effective_chat
-    if not await context.bot.get_chat_member(chat.id, context.bot.id).can_restrict_members:
-        await update.message.reply_text('Bot lacks kick permission.')
-        return
-    await context.bot.ban_chat_member(chat_id=chat.id, user_id=user.id)
-    await context.bot.unban_chat_member(chat_id=chat.id, user_id=user.id)
-    await update.message.reply_text(f'Kicked {user.first_name}.')
-
-application.add_handler(CommandHandler("kick", kick))
-
-# Command: /mute
-async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text('Reply to a user message to mute.')
-        return
-    user = update.message.reply_to_message.from_user
-    chat = update.effective_chat
-    if not await context.bot.get_chat_member(chat.id, context.bot.id).can_restrict_members:
-        await update.message.reply_text('Bot lacks mute permission.')
-        return
-    until_date = None
-    if context.args:
-        try:
-            until_date = int(context.args[0])
-        except ValueError:
-            await update.message.reply_text('Invalid time (use seconds).')
-            return
-    permissions = ChatPermissions(can_send_messages=False)
-    await context.bot.restrict_chat_member(chat_id=chat.id, user_id=user.id, permissions=permissions, until_date=until_date)
-    await update.message.reply_text(f'Muted {user.first_name}.')
-
-application.add_handler(CommandHandler("mute", mute))
-
-# Command: /unmute
-async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text('Reply to a user message to unmute.')
-        return
-    user = update.message.reply_to_message.from_user
-    chat = update.effective_chat
-    if not await context.bot.get_chat_member(chat.id, context.bot.id).can_restrict_members:
-        await update.message.reply_text('Bot lacks unmute permission.')
-        return
-    permissions = ChatPermissions.all()
-    await context.bot.restrict_chat_member(chat_id=chat.id, user_id=user.id, permissions=permissions)
-    await update.message.reply_text(f'Unmuted {user.first_name}.')
-
-application.add_handler(CommandHandler("unmute", unmute))
-
-# Command: /warn
-async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text('Reply to a user message to warn.')
-        return
-    user = update.message.reply_to_message.from_user
-    chat_id = update.effective_chat.id
-    user_id = user.id
-    count = get_warns(user_id, chat_id) + 1
-    set_warns(user_id, chat_id, count)
-    reason = ' '.join(context.args) if context.args else 'No reason'
-    await update.message.reply_text(f'Warned {user.first_name}. Warns: {count}. Reason: {reason}')
-    if count >= 3:
-        await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
-        await update.message.reply_text(f'Auto-banned {user.first_name} (3 warns reached).')
-
-application.add_handler(CommandHandler("warn", warn))
-
-# Command: /unwarn
-async def unwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text('Reply to a user message to unwarn.')
-        return
-    user = update.message.reply_to_message.from_user
-    chat_id = update.effective_chat.id
-    count = get_warns(user.id, chat_id) - 1
-    if count < 0:
-        count = 0
-    set_warns(user.id, chat_id, count)
-    await update.message.reply_text(f'Unwarned {user.first_name}. Remaining: {count}')
-
-application.add_handler(CommandHandler("unwarn", unwarn))
-
-# Command: /warns
-async def show_warns(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # target
     if update.message.reply_to_message:
-        user = update.message.reply_to_message.from_user
+        target = update.message.reply_to_message.from_user
     else:
-        user = update.effective_user
-    chat_id = update.effective_chat.id
-    count = get_warns(user.id, chat_id)
-    await update.message.reply_text(f'{user.first_name} has {count} warns.')
+        # try parse @username or id
+        target = None
+        if context.args:
+            try:
+                user_mention = context.args[0]
+                if user_mention.startswith("@"):
+                    members = await context.bot.get_chat_administrators(update.effective_chat.id)  # fallback
+                # For brevity: require reply to message for reliable target
+            except Exception:
+                pass
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Please reply to a user's message to mute them.")
+        return
+    target = update.message.reply_to_message.from_user
+    dur = parse_duration(context.args[0]) if len(context.args) > 0 else None
+    until = None
+    if dur:
+        until_ts = int(time.time()) + dur
+        until = datetime.utcfromtimestamp(until_ts)
+        add_mute(update.effective_chat.id, target.id, until_ts)
+    else:
+        until = None
+        add_mute(update.effective_chat.id, target.id, 2147483647)
+    perms = ChatPermissions(can_send_messages=False, can_send_media_messages=False,
+                            can_send_polls=False, can_send_other_messages=False,
+                            can_add_web_page_previews=False, can_change_info=False,
+                            can_invite_users=False, can_pin_messages=False)
+    try:
+        await context.bot.restrict_chat_member(update.effective_chat.id, target.id, permissions=perms, until_date=until)
+        await update.message.reply_text(f"Muted {target.mention_html()} for {context.args[0] if dur else 'indefinitely' }", parse_mode="HTML")
+    except Exception as e:
+        await update.message.reply_text("Failed to mute: " + str(e))
 
-application.add_handler(CommandHandler("warns", show_warns))
+async def unmute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update, update.effective_user.id):
+        await update.message.reply_text("Only admins can unmute.")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Reply to the user's message to unmute.")
+        return
+    target = update.message.reply_to_message.from_user
+    perms = ChatPermissions(can_send_messages=True, can_send_media_messages=True,
+                            can_send_polls=True, can_send_other_messages=True,
+                            can_add_web_page_previews=True, can_change_info=False,
+                            can_invite_users=True, can_pin_messages=False)
+    try:
+        remove_mute(update.effective_chat.id, target.id)
+        await context.bot.restrict_chat_member(update.effective_chat.id, target.id, permissions=perms, until_date=None)
+        await update.message.reply_text(f"Unmuted {target.mention_html()}", parse_mode="HTML")
+    except Exception as e:
+        await update.message.reply_text("Failed to unmute: " + str(e))
 
-# Command: /del
-async def delete_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.reply_to_message:
-        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.reply_to_message.message_id)
-    await update.message.delete()
-
-application.add_handler(CommandHandler("del", delete_last))
-
-# Command: /purge
-async def purge(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    count = int(context.args[0]) if context.args else 5
-    chat_id = update.effective_chat.id
-    message_id = update.message.message_id
-    for i in range(count + 1):  # +1 to include command
+async def warn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update, update.effective_user.id):
+        await update.message.reply_text("Only admins can warn.")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Reply to the user you want to warn.")
+        return
+    target = update.message.reply_to_message.from_user
+    reason = " ".join(context.args) if context.args else "No reason provided"
+    add_warn(update.effective_chat.id, target.id, target.username or target.full_name, reason)
+    count = get_warns(update.effective_chat.id, target.id)
+    await update.message.reply_text(f"{target.mention_html()} has been warned. Total warns: {count}", parse_mode="HTML")
+    if count >= WARN_THRESHOLD:
+        # auto-action: mute for 1 hour
+        until_ts = int(time.time()) + 3600
+        add_mute(update.effective_chat.id, target.id, until_ts)
+        perms = ChatPermissions(can_send_messages=False, can_send_media_messages=False,
+                                can_send_polls=False, can_send_other_messages=False,
+                                can_add_web_page_previews=False)
         try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=message_id - i)
-        except:
+            await context.bot.restrict_chat_member(update.effective_chat.id, target.id, permissions=perms, until_date=datetime.utcfromtimestamp(until_ts))
+            await update.message.reply_text(f"{target.mention_html()} reached {WARN_THRESHOLD} warns — auto-muted 1h", parse_mode="HTML")
+        except Exception:
             pass
 
-application.add_handler(CommandHandler("purge", purge))
-
-# Command: /rules
-async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    rules_text = get_setting(chat_id, 'rules')
-    if not rules_text:
-        await update.message.reply_text('No rules set.')
-    else:
-        await update.message.reply_text(rules_text)
-
-application.add_handler(CommandHandler("rules", rules))
-
-# Command: /setrules
-async def set_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text('Provide rules text.')
+async def unwarn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update, update.effective_user.id):
+        await update.message.reply_text("Only admins can unwarn.")
         return
-    chat_id = update.effective_chat.id
-    rules_text = ' '.join(context.args)
-    set_setting(chat_id, 'rules', rules_text)
-    await update.message.reply_text('Rules updated.')
-
-application.add_handler(CommandHandler("setrules", set_rules))
-
-# Handler: Welcome new members
-async def welcome_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    welcome_msg = get_setting(chat_id, 'welcome')
-    if welcome_msg:
-        for member in update.message.new_chat_members:
-            name = member.first_name or member.username or 'User'
-            formatted = welcome_msg.format(name=name)
-            await update.message.reply_text(formatted)
-
-application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new))
-
-# Command: /welcome
-async def show_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    welcome_msg = get_setting(chat_id, 'welcome')
-    if not welcome_msg:
-        await update.message.reply_text('No welcome message set.')
-    else:
-        await update.message.reply_text(welcome_msg)
-
-application.add_handler(CommandHandler("welcome", show_welcome))
-
-# Command: /setwelcome
-async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text('Provide welcome text (use {name} for user name).')
-        return
-    chat_id = update.effective_chat.id
-    msg = ' '.join(context.args)
-    set_setting(chat_id, 'welcome', msg)
-    await update.message.reply_text('Welcome message updated.')
-
-application.add_handler(CommandHandler("setwelcome", set_welcome))
-
-# Handler: Goodbye leaving members
-async def goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.left_chat_member:
-        user = update.message.left_chat_member
-        chat_id = update.effective_chat.id
-        goodbye_msg = get_setting(chat_id, 'goodbye')
-        if goodbye_msg:
-            name = user.first_name or user.username or 'User'
-            formatted = goodbye_msg.format(name=name)
-            await update.message.reply_text(formatted)
-
-application.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, goodbye))
-
-# Command: /goodbye
-async def show_goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    goodbye_msg = get_setting(chat_id, 'goodbye')
-    if not goodbye_msg:
-        await update.message.reply_text('No goodbye message set.')
-    else:
-        await update.message.reply_text(goodbye_msg)
-
-application.add_handler(CommandHandler("goodbye", show_goodbye))
-
-# Command: /setgoodbye
-async def set_goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text('Provide goodbye text (use {name} for user name).')
-        return
-    chat_id = update.effective_chat.id
-    msg = ' '.join(context.args)
-    set_setting(chat_id, 'goodbye', msg)
-    await update.message.reply_text('Goodbye message updated.')
-
-application.add_handler(CommandHandler("setgoodbye", set_goodbye))
-
-# Command: /pin
-async def pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message:
-        await update.message.reply_text('Reply to a message to pin.')
+        await update.message.reply_text("Reply to the user to unwarn.")
         return
-    if not await context.bot.get_chat_member(update.effective_chat.id, context.bot.id).can_pin_messages:
-        await update.message.reply_text('Bot lacks pin permission.')
+    target = update.message.reply_to_message.from_user
+    count = None
+    if context.args and context.args[0].isdigit():
+        count = int(context.args[0])
+    clear_warns(update.effective_chat.id, target.id, count)
+    await update.message.reply_text(f"Removed warns for {target.mention_html()}", parse_mode="HTML")
+
+async def invite_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update, update.effective_user.id):
+        await update.message.reply_text("Only admins can create invite links.")
         return
-    await context.bot.pin_chat_message(chat_id=update.effective_chat.id, message_id=update.message.reply_to_message.message_id)
-    await update.message.reply_text('Message pinned.')
-
-application.add_handler(CommandHandler("pin", pin))
-
-# Command: /unpin
-async def unpin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await context.bot.get_chat_member(update.effective_chat.id, context.bot.id).can_pin_messages:
-        await update.message.reply_text('Bot lacks unpin permission.')
-        return
-    await context.bot.unpin_chat_message(chat_id=update.effective_chat.id)
-    await update.message.reply_text('Message unpinned.')
-
-application.add_handler(CommandHandler("unpin", unpin))
-
-# Command: /promote
-async def promote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text('Reply to a user message to promote.')
-        return
-    user = update.message.reply_to_message.from_user
-    chat = update.effective_chat
-    if not await context.bot.get_chat_member(chat.id, context.bot.id).can_promote_members:
-        await update.message.reply_text('Bot lacks promote permission.')
-        return
-    await context.bot.promote_chat_member(chat_id=chat.id, user_id=user.id, can_change_info=False, can_delete_messages=True, can_restrict_members=True, can_invite_users=True, can_pin_messages=True, can_manage_video_chats=False, can_manage_chat=False)
-    await update.message.reply_text(f'Promoted {user.first_name}.')
-
-application.add_handler(CommandHandler("promote", promote))
-
-# Command: /demote
-async def demote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text('Reply to a user message to demote.')
-        return
-    user = update.message.reply_to_message.from_user
-    chat = update.effective_chat
-    if not await context.bot.get_chat_member(chat.id, context.bot.id).can_promote_members:
-        await update.message.reply_text('Bot lacks demote permission.')
-        return
-    await context.bot.promote_chat_member(chat_id=chat.id, user_id=user.id, can_change_info=False, can_delete_messages=False, can_restrict_members=False, can_invite_users=False, can_pin_messages=False, can_manage_video_chats=False, can_manage_chat=False)
-    await update.message.reply_text(f'Demoted {user.first_name}.')
-
-application.add_handler(CommandHandler("demote", demote))
-
-# Command: /lock
-async def lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if not await context.bot.get_chat_member(chat.id, context.bot.id).can_restrict_members:
-        await update.message.reply_text('Bot lacks lock permission.')
-        return
-    permissions = ChatPermissions(
-        can_send_messages=False,
-        can_send_media_messages=False,
-        can_send_polls=False,
-        can_send_other_messages=False,
-        can_add_web_page_previews=False
-    )
-    await context.bot.set_chat_permissions(chat_id=chat.id, permissions=permissions)
-    await update.message.reply_text('Chat locked (non-admins cannot send messages).')
-
-application.add_handler(CommandHandler("lock", lock))
-
-# Command: /unlock
-async def unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if not await context.bot.get_chat_member(chat.id, context.bot.id).can_restrict_members:
-        await update.message.reply_text('Bot lacks unlock permission.')
-        return
-    permissions = ChatPermissions.all()
-    await context.bot.set_chat_permissions(chat_id=chat.id, permissions=permissions)
-    await update.message.reply_text('Chat unlocked.')
-
-application.add_handler(CommandHandler("unlock", unlock))
-
-# Command: /slowmode
-async def slowmode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Usage: /invite 1h  or reply to user to invite them via link
     if not context.args:
-        await update.message.reply_text('Provide seconds (0 to disable).')
+        await update.message.reply_text("Usage: /invite <duration> e.g. /invite 2h")
         return
+    dur = parse_duration(context.args[0])
+    if dur is None:
+        await update.message.reply_text("Invalid duration. Use s/m/h/d like '30m', '2h'.")
+        return
+    expire_dt = datetime.utcnow() + timedelta(seconds=dur)
+    chat = update.effective_chat
     try:
-        seconds = int(context.args[0])
-        if seconds < 0 or seconds > 600:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text('Invalid: 0-600 seconds.')
-        return
-    chat = update.effective_chat
-    if not await context.bot.get_chat_member(chat.id, context.bot.id).can_restrict_members:
-        await update.message.reply_text('Bot lacks slowmode permission.')
-        return
-    await context.bot.set_chat_slow_mode_delay(chat_id=chat.id, slow_mode_delay=seconds)
-    status = 'disabled' if seconds == 0 else f'set to {seconds}s'
-    await update.message.reply_text(f'Slow mode {status}.')
+        res = await context.bot.create_chat_invite_link(chat.id, expire_date=expire_dt, member_limit=1)
+        link = res.invite_link
+        con = sqlite3.connect(DB)
+        cur = con.cursor()
+        cur.execute("INSERT INTO invites VALUES (?,?,?)", (chat.id, link, int(expire_dt.timestamp())))
+        con.commit(); con.close()
+        await update.message.reply_text(f"Invite link (expires at {expire_dt.isoformat()} UTC):\n{link}")
+    except Exception as e:
+        await update.message.reply_text("Failed to create invite link: " + str(e))
 
-application.add_handler(CommandHandler("slowmode", slowmode))
+# --- periodic task to lift expired mutes ---
+async def expire_checker(app):
+    while True:
+        # check mutes that expired and unrestrict them
+        rows = list_mutes_expired()
+        for chat_id, user_id in rows:
+            try:
+                perms = ChatPermissions(can_send_messages=True, can_send_media_messages=True,
+                                        can_send_polls=True, can_send_other_messages=True,
+                                        can_add_web_page_previews=True)
+                await app.bot.restrict_chat_member(chat_id, user_id, permissions=perms, until_date=None)
+            except Exception:
+                pass
+            remove_mute(chat_id, user_id)
+        await asyncio.sleep(30)
 
-# Command: /stats
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    member_count = await context.bot.get_chat_member_count(chat.id)
-    await update.message.reply_text(f'Group stats:\nMembers: {member_count}')
+# --- small aiohttp webserver for keepalive render ---
+async def status_handler(request):
+    # basic status page: uptime, active chats, pending warns count
+    # For demo: compute uptime from start_ts
+    start_ts = request.app["start_ts"]
+    uptime = int(time.time()) - start_ts
+    con = sqlite3.connect(DB)
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(DISTINCT chat_id) FROM warns")
+    (active_chats_warns,) = cur.fetchone()
+    cur.execute("SELECT COUNT(*) FROM warns")
+    (total_warns,) = cur.fetchone()
+    cur.close(); con.close()
+    html = f"""
+    <html><body>
+      <h2>Bot Status</h2>
+      <p>Uptime: {uptime} seconds</p>
+      <p>Chats with warns: {active_chats_warns}</p>
+      <p>Total warns: {total_warns}</p>
+      <p>Time: {datetime.utcnow().isoformat()} UTC</p>
+    </body></html>
+    """
+    return web.Response(text=html, content_type="text/html")
 
-application.add_handler(CommandHandler("stats", stats))
+async def run_webapp(app):
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    await site.start()
 
-# Command: /broadcast
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text('Provide message to broadcast.')
-        return
-    msg = ' '.join(context.args)
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=msg)
-    await update.message.reply_text('Message broadcasted.')
+# --- main startup ---
+async def main():
+    init_db()
+    app = ApplicationBuilder().token(API_TOKEN).build()
 
-application.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("clean", clean_cmd))
+    app.add_handler(CommandHandler("mute", mute_cmd))
+    app.add_handler(CommandHandler("unmute", unmute_cmd))
+    app.add_handler(CommandHandler("warn", warn_cmd))
+    app.add_handler(CommandHandler("unwarn", unwarn_cmd))
+    app.add_handler(CommandHandler("invite", invite_cmd))
 
-# Flask routes for Render keep-alive
-@app.route('/')
-def health():
-    return 'Bot is running and healthy!'
+    # start expire task
+    app.create_task(expire_checker(app))
 
-@app.route('/keepalive', methods=['GET'])
-def keepalive():
-    return 'Keep-alive ping received.'
+    # start tiny web server for status page (aiohttp)
+    aio_app = web.Application()
+    aio_app["start_ts"] = int(time.time())
+    aio_app.router.add_get("/status", status_handler)
+    app.create_task(run_webapp(aio_app))
 
-# Run bot in background thread (polling)
-def run_bot():
-    application.run_polling(drop_pending_updates=True)
+    await app.run_polling()
 
-if __name__ == '__main__':
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
