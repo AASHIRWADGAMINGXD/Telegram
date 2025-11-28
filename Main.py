@@ -1,605 +1,633 @@
-#!/usr/bin/env python3
-"""
-Telegram Moderator Bot (single-file)
-- Uses python-telegram-bot v20+ (async)
-- Persistent JSON store for: authorized users, warnings, mutes, bans, rules
-- Password-based authorization (env var PASSWORD or /auth <password>)
-- aiohttp keep-alive endpoint (for Render / uptime checks)
-- Designed for group moderation; many commands require admin/owner authorization
-"""
-
+# main.py
 import os
-import json
-import asyncio
-from pathlib import Path
-from typing import Dict, Any, Set
+import logging
+import sqlite3
+import threading
+import time
+from datetime import datetime, timedelta
 
-from aiohttp import web
-
-from telegram import Update, ChatPermissions, Message, ChatMember
+from flask import Flask, jsonify
+from telegram import Bot, Update, ChatPermissions, ParseMode
 from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    CallbackContext,
+    Updater, CommandHandler, MessageHandler, Filters, CallbackContext, Dispatcher,
 )
 
-# ---------- CONFIG ----------
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "<PUT_YOUR_TOKEN_HERE>")
-PASSWORD = os.environ.get("BOT_PASSWORD", "Pain1")  # change before deploy!
-DATA_FILE = Path("bot_data.json")
-PORT = int(os.environ.get("PORT", "8443"))  # Render provides PORT env var
-OWNER_ID = int(os.environ.get("OWNER_ID", "0"))  # optional owner override (int id)
-# ----------------------------
+# ---------- Configuration ----------
+TOKEN = os.getenv("BOT_TOKEN")  # set on Render as an env var
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # optional owner id
+DATABASE = os.getenv("DB_PATH", "bot.db")
+PORT = int(os.getenv("PORT", "8000"))
 
-# Default structure for persistent storage
-DEFAULT_DATA = {
-    "authorized": [],   # list of user ids allowed to run moderation commands
-    "warnings": {},     # {chat_id: {user_id: [reason1, reason2, ...]}}
-    "mutes": {},        # {chat_id: {user_id: unmute_timestamp_or_0_for_indefinite}}
-    "bans": {},         # {chat_id: [user_id1, user_id2...]}
-    "rules": {},        # {chat_id: "rules text"}
-}
+# ---------- Logging ----------
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# ---------------- persistence helpers ----------------
-def load_data() -> Dict[str, Any]:
-    if DATA_FILE.exists():
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return DEFAULT_DATA.copy()
-    else:
-        return DEFAULT_DATA.copy()
+# ---------- Database ----------
+def init_db():
+    conn = sqlite3.connect(DATABASE, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS settings(
+        chat_id INTEGER PRIMARY KEY,
+        welcome TEXT,
+        rules TEXT,
+        log_chat TEXT
+    )''')
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS warns(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER,
+        user_id INTEGER,
+        username TEXT,
+        reason TEXT,
+        ts INTEGER
+    )''')
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS logs(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER,
+        actor_id INTEGER,
+        action TEXT,
+        target_id INTEGER,
+        reason TEXT,
+        ts INTEGER
+    )''')
+    conn.commit()
+    return conn
 
+db = init_db()
+db_lock = threading.Lock()
 
-def save_data(data: Dict[str, Any]):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+# ---------- Helper DB functions ----------
+def set_setting(chat_id, key, value):
+    with db_lock:
+        cur = db.cursor()
+        cur.execute("INSERT OR IGNORE INTO settings(chat_id, welcome, rules, log_chat) VALUES(?,?,?,?)", (chat_id, None, None, None))
+        if key == "welcome":
+            cur.execute("UPDATE settings SET welcome=? WHERE chat_id=?", (value, chat_id))
+        elif key == "rules":
+            cur.execute("UPDATE settings SET rules=? WHERE chat_id=?", (value, chat_id))
+        elif key == "log_chat":
+            cur.execute("UPDATE settings SET log_chat=? WHERE chat_id=?", (value, chat_id))
+        db.commit()
 
+def get_setting(chat_id):
+    with db_lock:
+        cur = db.cursor()
+        cur.execute("SELECT welcome, rules, log_chat FROM settings WHERE chat_id=?", (chat_id,))
+        row = cur.fetchone()
+        return row if row else (None, None, None)
 
-DATA = load_data()
+def add_warn(chat_id, user_id, username, reason):
+    with db_lock:
+        cur = db.cursor()
+        cur.execute("INSERT INTO warns(chat_id, user_id, username, reason, ts) VALUES(?,?,?,?,?)",
+                    (chat_id, user_id, username or "", reason or "", int(time.time())))
+        db.commit()
 
-def ensure_chat_structures(chat_id: str):
-    chat_id = str(chat_id)
-    if chat_id not in DATA.get("warnings", {}):
-        DATA.setdefault("warnings", {})[chat_id] = {}
-    if chat_id not in DATA.get("mutes", {}):
-        DATA.setdefault("mutes", {})[chat_id] = {}
-    if chat_id not in DATA.get("bans", {}):
-        DATA.setdefault("bans", {})[chat_id] = []
-    if chat_id not in DATA.get("rules", {}):
-        DATA.setdefault("rules", {})[chat_id] = ""
+def get_warns(chat_id, user_id):
+    with db_lock:
+        cur = db.cursor()
+        cur.execute("SELECT id, reason, ts FROM warns WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+        return cur.fetchall()
 
+def clear_warns(chat_id, user_id):
+    with db_lock:
+        cur = db.cursor()
+        cur.execute("DELETE FROM warns WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+        db.commit()
 
-# --------------- auth decorators ----------------
-def is_authorized(user_id: int) -> bool:
-    if OWNER_ID and user_id == OWNER_ID:
-        return True
-    return int(user_id) in [int(x) for x in DATA.get("authorized", [])]
+def add_log(chat_id, actor_id, action, target_id=None, reason=None):
+    with db_lock:
+        cur = db.cursor()
+        cur.execute("INSERT INTO logs(chat_id, actor_id, action, target_id, reason, ts) VALUES(?,?,?,?,?,?)",
+                    (chat_id, actor_id, action, target_id or 0, reason or "", int(time.time())))
+        db.commit()
 
+def get_logs(chat_id, limit=10):
+    with db_lock:
+        cur = db.cursor()
+        cur.execute("SELECT actor_id, action, target_id, reason, ts FROM logs WHERE chat_id=? ORDER BY id DESC LIMIT ?",
+                    (chat_id, limit))
+        return cur.fetchall()
 
-def require_auth(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+# ---------- Permissions helpers ----------
+def is_user_admin(bot: Bot, chat_id: int, user_id: int):
+    try:
+        member = bot.get_chat_member(chat_id, user_id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+def require_admin(fn):
+    def wrapper(update: Update, context: CallbackContext):
+        chat = update.effective_chat
         user = update.effective_user
-        if user and is_authorized(user.id):
-            return await func(update, context, *args, **kwargs)
+        if chat.type == "private":
+            # allow in private only owner
+            if OWNER_ID and user.id != OWNER_ID:
+                update.message.reply_text("You must be the owner to use this in private.")
+                return
         else:
-            await update.message.reply_text("Unauthorized. Use /auth <password> to authenticate.")
+            if not is_user_admin(context.bot, chat.id, user.id):
+                update.message.reply_text("You must be an admin to use this command.")
+                return
+        return fn(update, context)
+    wrapper.__name__ = fn.__name__
     return wrapper
 
+# ---------- Telegram handlers ----------
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text("Hello! I'm ModerationBot. Use /help to see commands.")
 
-# ----------------- command handlers -----------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def help_cmd(update: Update, context: CallbackContext):
     txt = (
-        "Moderator Bot online.\n"
-        "This is a private moderation bot. To authenticate: /auth <password>\n"
-        "Use /help_mod to see moderator commands (auth required)."
+        "Moderation commands:\n"
+        "/help - this message\n"
+        "/ping - bot latency\n"
+        "/setwelcome <text> - set welcome message (admin)\n"
+        "/delwelcome - delete welcome\n"
+        "/setrules <text> - set group rules\n"
+        "/showrules - show rules\n"
+        "/warn @user [reason] - add a warning (admin)\n"
+        "/warnings @user - list warnings\n"
+        "/clearwarns @user - clear warnings (admin)\n"
+        "/mute @user [reason] - mute user (admin)\n"
+        "/unmute @user - unmute (admin)\n"
+        "/tempmute @user <minutes> - temp mute\n"
+        "/ban @user [reason] - ban user (admin)\n"
+        "/unban user_id - unban (admin)\n"
+        "/tempban @user <minutes> - temporary ban\n"
+        "/kick @user - kick user\n"
+        "/promote @user - promote to admin (bot must be admin)\n"
+        "/demote @user - demote admin\n"
+        "/pin - pin replied message (admin)\n"
+        "/unpin - unpin\n"
+        "/purge <N> - delete last N messages (admin)\n"
+        "/setlog <chat_id|@channel> - set log chat (admin)\n"
+        "/logs [n] - show last logs\n"
+        "/restrict @user - restrict user (admin)\n"
+        "/allow @user - restore permissions (admin)\n"
+        "/report @user [reason] - report a user\n"
+        "/clean - delete bot messages in reply range\n    "
     )
-    await update.message.reply_text(txt)
+    update.message.reply_text(txt)
 
+def ping(update: Update, context: CallbackContext):
+    start = time.time()
+    msg = update.message.reply_text("Pinging...")
+    latency = (time.time() - start) * 1000
+    msg.edit_text(f"Pong! {int(latency)} ms")
 
-async def auth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /auth <password>
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /auth <password>")
+def save_welcome(update: Update, context: CallbackContext):
+    if update.effective_chat.type == "private":
+        update.message.reply_text("Welcome messages only make sense in groups.")
         return
-    provided = args[0]
-    user_id = update.effective_user.id
-    if provided == PASSWORD:
-        if user_id not in DATA.get("authorized", []):
-            DATA.setdefault("authorized", []).append(user_id)
-            save_data(DATA)
-        await update.message.reply_text("Authenticated ✅ — you can use moderation commands now.")
-    else:
-        await update.message.reply_text("Wrong password ❌")
-
-
-async def unauth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /unauth - remove yourself
-    user_id = update.effective_user.id
-    if user_id in DATA.get("authorized", []):
-        DATA["authorized"].remove(user_id)
-        save_data(DATA)
-        await update.message.reply_text("You have been deauthorized.")
-    else:
-        await update.message.reply_text("You were not authorized.")
-
-
-# Show help for moderation commands
-@require_auth
-async def help_mod(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "Moderator commands:\n"
-        "/ban <reply/user_id> [reason]\n"
-        "/unban <user_id>\n"
-        "/kick <reply>\n"
-        "/mute <reply_or_id> [minutes]\n"
-        "/unmute <reply_or_id>\n"
-        "/warn <reply_or_id> [reason]\n"
-        "/warnings <user_id or reply>\n"
-        "/clear <n> - delete last n messages (admin only)\n"
-        "/purge <user_id> - delete last 100 messages from a user\n"
-        "/pin [reply]\n"
-        "/unpin [message_id]\n"
-        "/lock - restrict sending messages in group\n"
-        "/unlock\n"
-        "/setrules <text>\n"
-        "/getrules\n"
-        "/promote <reply>\n"
-        "/demote <reply>\n"
-        "/stats\n"
-        "/setpassword <newpassword> (owner only if OWNER_ID set)\n"
-        "/auth /unauth\n"
-    )
-    await update.message.reply_text(help_text)
-
-
-# Helper: extract target user id from reply or args
-def extract_target_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    if msg.reply_to_message:
-        return msg.reply_to_message.from_user.id
-    if context.args:
-        try:
-            return int(context.args[0])
-        except:
-            return None
-    return None
-
-
-@require_auth
-async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    target = extract_target_user(update, context)
-    reason = " ".join(context.args[1:]) if len(context.args) > 1 else "No reason"
-    if not target:
-        await update.message.reply_text("Reply to a user or provide user_id to ban.")
-        return
-    try:
-        await context.bot.ban_chat_member(chat.id, target)
-        DATA.setdefault("bans", {}).setdefault(str(chat.id), [])
-        if target not in DATA["bans"][str(chat.id)]:
-            DATA["bans"][str(chat.id)].append(target)
-            save_data(DATA)
-        await update.message.reply_text(f"Banned {target}\nReason: {reason}")
-    except Exception as e:
-        await update.message.reply_text(f"Failed to ban: {e}")
-
-
-@require_auth
-async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /unban <user_id>")
+        update.message.reply_text("Usage: /setwelcome Welcome text with {first} or {name}")
         return
-    try:
-        user_id = int(context.args[0])
-    except:
-        await update.message.reply_text("Invalid user_id.")
+    text = ' '.join(context.args)
+    set_setting(update.effective_chat.id, "welcome", text)
+    update.message.reply_text("Welcome message saved.")
+    add_log(update.effective_chat.id, update.effective_user.id, "set_welcome", None, text)
+
+def del_welcome(update: Update, context: CallbackContext):
+    set_setting(update.effective_chat.id, "welcome", None)
+    update.message.reply_text("Welcome message deleted.")
+    add_log(update.effective_chat.id, update.effective_user.id, "del_welcome")
+
+def set_rules(update: Update, context: CallbackContext):
+    if not context.args:
+        update.message.reply_text("Usage: /setrules <text>")
         return
-    chat = update.effective_chat
-    try:
-        await context.bot.unban_chat_member(chat.id, user_id)
-        DATA.setdefault("bans", {}).setdefault(str(chat.id), [])
-        if user_id in DATA["bans"][str(chat.id)]:
-            DATA["bans"][str(chat.id)].remove(user_id)
-            save_data(DATA)
-        await update.message.reply_text(f"Unbanned {user_id}")
-    except Exception as e:
-        await update.message.reply_text(f"Failed to unban: {e}")
+    text = ' '.join(context.args)
+    set_setting(update.effective_chat.id, "rules", text)
+    update.message.reply_text("Rules saved.")
+    add_log(update.effective_chat.id, update.effective_user.id, "set_rules", None, text)
 
+def show_rules(update: Update, context: CallbackContext):
+    welcome, rules, log_chat = get_setting(update.effective_chat.id)
+    if rules:
+        update.message.reply_text(rules)
+    else:
+        update.message.reply_text("No rules set. Use /setrules <text>")
 
-@require_auth
-async def kick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target = extract_target_user(update, context)
-    if not target:
-        await update.message.reply_text("Reply to a user to kick.")
+def new_member_welcome(update: Update, context: CallbackContext):
+    welcome, rules, log_chat = get_setting(update.effective_chat.id)
+    for m in update.message.new_chat_members:
+        name = m.full_name
+        text = welcome or f"Welcome, {name}!"
+        text = text.replace("{first}", m.first_name or "").replace("{name}", name)
+        update.message.reply_text(text)
+        add_log(update.effective_chat.id, context.bot.id, "welcome", m.id, text)
+
+# ---------- warnings & report ----------
+@require_admin
+def warn_user(update: Update, context: CallbackContext):
+    if not update.message.reply_to_message and not context.args:
+        update.message.reply_text("Reply to a user or use /warn @user [reason]")
         return
-    chat = update.effective_chat
-    try:
-        await context.bot.ban_chat_member(chat.id, target)
-        await context.bot.unban_chat_member(chat.id, target)  # kick -> ban + unban
-        await update.message.reply_text(f"Kicked {target}")
-    except Exception as e:
-        await update.message.reply_text(f"Failed to kick: {e}")
+    target = None
+    reason = None
+    if update.message.reply_to_message:
+        target = update.message.reply_to_message.from_user
+        reason = ' '.join(context.args) if context.args else ""
+    else:
+        # parse args for username
+        if len(context.args) >= 1:
+            username = context.args[0]
+            reason = ' '.join(context.args[1:]) if len(context.args) > 1 else ""
+            try:
+                target = context.bot.get_chat_member(update.effective_chat.id, username).user
+            except Exception:
+                update.message.reply_text("Couldn't find that user. Reply to them instead or pass their id.")
+                return
+    add_warn(update.effective_chat.id, target.id, target.username, reason)
+    update.message.reply_text(f"{target.full_name} has been warned. Reason: {reason}")
+    add_log(update.effective_chat.id, update.effective_user.id, "warn", target.id, reason)
 
-
-@require_auth
-async def mute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target = extract_target_user(update, context)
-    if not target:
-        await update.message.reply_text("Reply to a user to mute.")
-        return
-    minutes = 0
-    if context.args:
+def warnings_cmd(update: Update, context: CallbackContext):
+    target = None
+    if update.message.reply_to_message:
+        target = update.message.reply_to_message.from_user
+    elif context.args:
         try:
-            minutes = int(context.args[-1])
-        except:
-            minutes = 0
-    until_date = None
-    if minutes > 0:
-        until_date = int((asyncio.get_event_loop().time() + minutes * 60))
-    chat = update.effective_chat
-    try:
-        await context.bot.restrict_chat_member(
-            chat_id=chat.id,
-            user_id=target,
-            permissions=ChatPermissions(can_send_messages=False),
-        )
-        ensure_chat_structures(chat.id)
-        DATA.setdefault("mutes", {}).setdefault(str(chat.id), {})[str(target)] = int(until_date or 0)
-        save_data(DATA)
-        msg = f"Muted {target}" + (f" for {minutes} minutes." if minutes else " indefinitely.")
-        await update.message.reply_text(msg)
-    except Exception as e:
-        await update.message.reply_text(f"Failed to mute: {e}")
-
-
-@require_auth
-async def unmute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target = extract_target_user(update, context)
-    if not target:
-        await update.message.reply_text("Reply to a user to unmute.")
-        return
-    chat = update.effective_chat
-    try:
-        await context.bot.restrict_chat_member(
-            chat_id=chat.id,
-            user_id=target,
-            permissions=ChatPermissions(
-                can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True
-            ),
-        )
-        DATA.setdefault("mutes", {}).setdefault(str(chat.id), {})
-        if str(target) in DATA["mutes"][str(chat.id)]:
-            DATA["mutes"][str(chat.id)].pop(str(target), None)
-            save_data(DATA)
-        await update.message.reply_text(f"Unmuted {target}")
-    except Exception as e:
-        await update.message.reply_text(f"Failed to unmute: {e}")
-
-
-@require_auth
-async def warn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target = extract_target_user(update, context)
-    if not target:
-        await update.message.reply_text("Reply to a user to warn.")
-        return
-    reason = " ".join(context.args[1:]) if len(context.args) > 1 else "No reason"
-    chat_id = str(update.effective_chat.id)
-    ensure_chat_structures(chat_id)
-    DATA.setdefault("warnings", {}).setdefault(chat_id, {}).setdefault(str(target), [])
-    DATA["warnings"][chat_id][str(target)].append(reason)
-    save_data(DATA)
-    await update.message.reply_text(f"Warned {target}. Reason: {reason}")
-
-
-@require_auth
-async def warnings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target = extract_target_user(update, context)
-    if not target and context.args:
-        try:
-            target = int(context.args[0])
-        except:
-            await update.message.reply_text("Invalid user id.")
+            target = context.bot.get_chat(context.args[0])
+        except Exception:
+            update.message.reply_text("Usage: reply to user or /warnings <user_id>")
             return
-    if not target:
-        await update.message.reply_text("Reply to a user or provide user_id to list warnings.")
-        return
-    chat_id = str(update.effective_chat.id)
-    ensure_chat_structures(chat_id)
-    user_warns = DATA.get("warnings", {}).get(chat_id, {}).get(str(target), [])
-    await update.message.reply_text(f"Warnings for {target}: {len(user_warns)}\n" + "\n".join(f"- {w}" for w in user_warns))
-
-
-@require_auth
-async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /clear n  - delete last n messages (bot must be admin + can_delete_messages)
-    if not context.args:
-        await update.message.reply_text("Usage: /clear <n>")
-        return
-    try:
-        n = int(context.args[0])
-    except:
-        await update.message.reply_text("Provide a number.")
-        return
-    chat = update.effective_chat
-    msgs = []
-    async for m in context.bot.get_chat(chat.id).iter_history(limit=n+1):  # +1 includes the command message
-        msgs.append(m.message_id)
-    for mid in msgs:
-        try:
-            await context.bot.delete_message(chat.id, mid)
-        except:
-            pass
-    await update.message.reply_text(f"Attempted to delete {n} messages.")
-
-
-@require_auth
-async def purge_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Purge last 100 messages from a user_id
-    target = extract_target_user(update, context)
-    if not target:
-        await update.message.reply_text("Reply to target user or provide user_id: /purge <user_id>")
-        return
-    chat = update.effective_chat
-    count = 0
-    async for m in context.bot.get_chat(chat.id).iter_history(limit=500):
-        if m.from_user and m.from_user.id == target:
-            try:
-                await context.bot.delete_message(chat.id, m.message_id)
-                count += 1
-            except:
-                pass
-    await update.message.reply_text(f"Purged {count} messages from {target}.")
-
-
-@require_auth
-async def pin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if msg.reply_to_message:
-        await context.bot.pin_chat_message(chat_id=msg.chat_id, message_id=msg.reply_to_message.message_id)
-        await msg.reply_text("Pinned the message.")
     else:
-        await msg.reply_text("Reply to a message to pin it.")
-
-
-@require_auth
-async def unpin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.unpin_all_chat_messages(chat_id=update.effective_chat.id)
-    await update.message.reply_text("Unpinned all messages.")
-
-
-@require_auth
-async def lock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    try:
-        await context.bot.set_chat_permissions(chat.id, ChatPermissions(can_send_messages=False))
-        await update.message.reply_text("Group locked: users cannot send messages.")
-    except Exception as e:
-        await update.message.reply_text(f"Failed to lock: {e}")
-
-
-@require_auth
-async def unlock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    try:
-        await context.bot.set_chat_permissions(chat.id, ChatPermissions(
-            can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True
-        ))
-        await update.message.reply_text("Group unlocked.")
-    except Exception as e:
-        await update.message.reply_text(f"Failed to unlock: {e}")
-
-
-@require_auth
-async def setrules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /setrules <rules text>")
+        update.message.reply_text("Reply to a user to see warnings.")
         return
-    chat_id = str(update.effective_chat.id)
-    DATA.setdefault("rules", {})[chat_id] = " ".join(context.args)
-    save_data(DATA)
-    await update.message.reply_text("Rules saved.")
-
-
-async def getrules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    text = DATA.get("rules", {}).get(chat_id) or "No rules set for this chat."
-    await update.message.reply_text(text)
-
-
-@require_auth
-async def promote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target = extract_target_user(update, context)
-    if not target:
-        await update.message.reply_text("Reply to user to promote.")
+    rows = get_warns(update.effective_chat.id, target.id)
+    if not rows:
+        update.message.reply_text("No warnings.")
         return
+    msg = f"Warnings for {target.full_name}:\n"
+    for r in rows:
+        ts = datetime.fromtimestamp(r[2]).strftime("%Y-%m-%d %H:%M")
+        msg += f"- {r[1]} (at {ts})\n"
+    update.message.reply_text(msg)
+
+@require_admin
+def clear_warnings_cmd(update: Update, context: CallbackContext):
+    target = None
+    if update.message.reply_to_message:
+        target = update.message.reply_to_message.from_user
+    elif context.args:
+        target_id = int(context.args[0])
+        target = context.bot.get_chat_member(update.effective_chat.id, target_id).user
+    else:
+        update.message.reply_text("Reply to a user to clear warnings.")
+        return
+    clear_warns(update.effective_chat.id, target.id)
+    update.message.reply_text(f"Warnings cleared for {target.full_name}.")
+    add_log(update.effective_chat.id, update.effective_user.id, "clear_warns", target.id)
+
+# ---------- mute/unmute/tempmute ----------
+@require_admin
+def mute_cmd(update: Update, context: CallbackContext):
+    if not update.message.reply_to_message:
+        update.message.reply_text("Reply to the user you want to mute.")
+        return
+    target = update.message.reply_to_message.from_user
     try:
-        await context.bot.promote_chat_member(
-            chat_id=update.effective_chat.id,
-            user_id=target,
-            can_change_info=True,
-            can_delete_messages=True,
-            can_invite_users=True,
-            can_manage_topics=True,
-            can_restrict_members=True,
-            can_pin_messages=True,
-            can_promote_members=False,
+        perms = ChatPermissions(can_send_messages=False)
+        context.bot.restrict_chat_member(update.effective_chat.id, target.id, perms)
+        update.message.reply_text(f"{target.full_name} muted.")
+        add_log(update.effective_chat.id, update.effective_user.id, "mute", target.id)
+    except Exception as e:
+        update.message.reply_text("Failed to mute: " + str(e))
+
+@require_admin
+def unmute_cmd(update: Update, context: CallbackContext):
+    if not update.message.reply_to_message:
+        update.message.reply_text("Reply to the user you want to unmute.")
+        return
+    target = update.message.reply_to_message.from_user
+    try:
+        perms = ChatPermissions(
+            can_send_messages=True, can_send_media_messages=True,
+            can_send_other_messages=True, can_add_web_page_previews=True
         )
-        await update.message.reply_text(f"Promoted {target}")
+        context.bot.restrict_chat_member(update.effective_chat.id, target.id, perms)
+        update.message.reply_text(f"{target.full_name} unmuted.")
+        add_log(update.effective_chat.id, update.effective_user.id, "unmute", target.id)
     except Exception as e:
-        await update.message.reply_text(f"Failed to promote: {e}")
+        update.message.reply_text("Failed to unmute: " + str(e))
 
-
-@require_auth
-async def demote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target = extract_target_user(update, context)
-    if not target:
-        await update.message.reply_text("Reply to user to demote.")
+@require_admin
+def tempmute_cmd(update: Update, context: CallbackContext):
+    if not update.message.reply_to_message or len(context.args) < 1:
+        update.message.reply_text("Usage: reply to user and /tempmute <minutes>")
         return
+    minutes = int(context.args[0])
+    target = update.message.reply_to_message.from_user
+    until = datetime.utcnow() + timedelta(minutes=minutes)
+    perms = ChatPermissions(can_send_messages=False)
     try:
-        await context.bot.promote_chat_member(
-            chat_id=update.effective_chat.id,
-            user_id=target,
-            can_change_info=False,
-            can_delete_messages=False,
-            can_invite_users=False,
-            can_manage_topics=False,
-            can_restrict_members=False,
-            can_pin_messages=False,
-            can_promote_members=False,
-        )
-        await update.message.reply_text(f"Demoted {target}")
+        context.bot.restrict_chat_member(update.effective_chat.id, target.id, perms, until_date=until)
+        update.message.reply_text(f"{target.full_name} muted for {minutes} minutes.")
+        add_log(update.effective_chat.id, update.effective_user.id, "tempmute", target.id, f"{minutes}m")
     except Exception as e:
-        await update.message.reply_text(f"Failed to demote: {e}")
+        update.message.reply_text("Failed to tempmute: " + str(e))
 
-
-@require_auth
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    warn_data = DATA.get("warnings", {}).get(chat_id, {})
-    mute_data = DATA.get("mutes", {}).get(chat_id, {})
-    ban_data = DATA.get("bans", {}).get(chat_id, [])
-    txt = (
-        f"Stats for chat {chat_id}:\n"
-        f"Warned users: {len(warn_data)}\n"
-        f"Muted users: {len(mute_data)}\n"
-        f"Banned users: {len(ban_data)}"
-    )
-    await update.message.reply_text(txt)
-
-
-@require_auth
-async def setpassword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Only owner can change password if OWNER_ID set
-    user = update.effective_user
-    if OWNER_ID and user.id != OWNER_ID:
-        await update.message.reply_text("Only the owner can change the bot password.")
+# ---------- ban/unban/tempban/kick ----------
+@require_admin
+def ban_cmd(update: Update, context: CallbackContext):
+    if not update.message.reply_to_message:
+        update.message.reply_text("Reply to the user you want to ban.")
         return
+    target = update.message.reply_to_message.from_user
+    reason = ' '.join(context.args) if context.args else None
+    try:
+        context.bot.kick_chat_member(update.effective_chat.id, target.id)
+        update.message.reply_text(f"{target.full_name} banned.")
+        add_log(update.effective_chat.id, update.effective_user.id, "ban", target.id, reason)
+    except Exception as e:
+        update.message.reply_text("Failed to ban: " + str(e))
+
+@require_admin
+def unban_cmd(update: Update, context: CallbackContext):
     if not context.args:
-        await update.message.reply_text("Usage: /setpassword <newpassword>")
+        update.message.reply_text("Usage: /unban <user_id>")
         return
-    new = context.args[0]
-    # Persisting password to environment is not possible from inside app; we save to DATA file (note: less secure)
-    DATA.setdefault("meta", {})["password"] = new
-    save_data(DATA)
-    await update.message.reply_text("Password changed in persistent store. (Also set BOT_PASSWORD env var on your host.)")
-
-
-# Simple echo-ignore handler to enforce mutes
-async def message_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # check mutes expired
-    chat_id = str(update.effective_chat.id)
-    ensure_chat_structures(chat_id)
-    mute_map = DATA.get("mutes", {}).get(chat_id, {})
-    to_unmute = []
-    now = int(asyncio.get_event_loop().time())
-    for uid_str, until in list(mute_map.items()):
-        if until and now >= int(until):
-            to_unmute.append(int(uid_str))
-            mute_map.pop(uid_str, None)
-    if to_unmute:
-        save_data(DATA)
-        for uid in to_unmute:
-            try:
-                await context.bot.restrict_chat_member(
-                    chat_id=int(chat_id),
-                    user_id=uid,
-                    permissions=ChatPermissions(
-                        can_send_messages=True,
-                        can_send_media_messages=True,
-                        can_send_other_messages=True
-                    )
-                )
-            except:
-                pass
-
-    # auto-delete messages from muted users (best-effort)
-    if update.message and update.message.from_user:
-        user_id = update.message.from_user.id
-        if str(user_id) in DATA.get("mutes", {}).get(chat_id, {}):
-            try:
-                await update.message.delete()
-            except:
-                pass
-
-
-# --------------- keep-alive (aiohttp) ----------------
-async def run_keep_alive(app):
-    async def index(request):
-        return web.Response(text="OK - bot alive")
-
-    web_app = web.Application()
-    web_app.router.add_get("/", index)
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    print(f"Keep-alive server running on port {PORT}")
-
-
-# --------------- main ---------------
-def main():
-    if TOKEN.startswith("<PUT") or not TOKEN:
-        print("Set TELEGRAM_BOT_TOKEN environment variable.")
-        return
-
-    application = ApplicationBuilder().token(TOKEN).build()
-
-    # Basic commands
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("auth", auth_cmd))
-    application.add_handler(CommandHandler("unauth", unauth_cmd))
-    application.add_handler(CommandHandler("help_mod", help_mod))
-    application.add_handler(CommandHandler("getrules", getrules_cmd))
-
-    # mod commands (require auth)
-    application.add_handler(CommandHandler("ban", ban_cmd))
-    application.add_handler(CommandHandler("unban", unban_cmd))
-    application.add_handler(CommandHandler("kick", kick_cmd))
-    application.add_handler(CommandHandler("mute", mute_cmd))
-    application.add_handler(CommandHandler("unmute", unmute_cmd))
-    application.add_handler(CommandHandler("warn", warn_cmd))
-    application.add_handler(CommandHandler("warnings", warnings_cmd))
-    application.add_handler(CommandHandler("clear", clear_cmd))
-    application.add_handler(CommandHandler("purge", purge_cmd))
-    application.add_handler(CommandHandler("pin", pin_cmd))
-    application.add_handler(CommandHandler("unpin", unpin_cmd))
-    application.add_handler(CommandHandler("lock", lock_cmd))
-    application.add_handler(CommandHandler("unlock", unlock_cmd))
-    application.add_handler(CommandHandler("setrules", setrules_cmd))
-    application.add_handler(CommandHandler("promote", promote_cmd))
-    application.add_handler(CommandHandler("demote", demote_cmd))
-    application.add_handler(CommandHandler("stats", stats_cmd))
-    application.add_handler(CommandHandler("setpassword", setpassword_cmd))
-    application.add_handler(CommandHandler("help", help_mod))
-
-    # message monitor to auto-delete messages from muted users and manage time-based unmute
-    application.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), message_monitor))
-
-    # Start both bot and keep-alive web server
-    async def runner():
-        # start keep-alive server (aiohttp) in background
-        await run_keep_alive(application)
-        # start the bot (polling)
-        print("Starting bot polling...")
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling()  # high-level start for PTB v20
-        # Keep running until stopped
-        while True:
-            await asyncio.sleep(10)
-
+    uid = int(context.args[0])
     try:
-        asyncio.run(runner())
-    except (KeyboardInterrupt, SystemExit):
-        print("Shutting down...")
-        save_data(DATA)
+        context.bot.unban_chat_member(update.effective_chat.id, uid)
+        update.message.reply_text(f"User {uid} unbanned.")
+        add_log(update.effective_chat.id, update.effective_user.id, "unban", uid)
+    except Exception as e:
+        update.message.reply_text("Failed to unban: " + str(e))
 
+@require_admin
+def tempban_cmd(update: Update, context: CallbackContext):
+    if not update.message.reply_to_message or len(context.args) < 1:
+        update.message.reply_text("Usage: reply + /tempban <minutes>")
+        return
+    minutes = int(context.args[0])
+    target = update.message.reply_to_message.from_user
+    until = datetime.utcnow() + timedelta(minutes=minutes)
+    try:
+        context.bot.kick_chat_member(update.effective_chat.id, target.id, until_date=until)
+        update.message.reply_text(f"{target.full_name} banned for {minutes} minutes.")
+        add_log(update.effective_chat.id, update.effective_user.id, "tempban", target.id, f"{minutes}m")
+    except Exception as e:
+        update.message.reply_text("Failed to tempban: " + str(e))
+
+@require_admin
+def kick_cmd(update: Update, context: CallbackContext):
+    if not update.message.reply_to_message:
+        update.message.reply_text("Reply to the user to kick.")
+        return
+    target = update.message.reply_to_message.from_user
+    try:
+        context.bot.kick_chat_member(update.effective_chat.id, target.id)
+        context.bot.unban_chat_member(update.effective_chat.id, target.id)  # so it's a kick not ban
+        update.message.reply_text(f"{target.full_name} kicked.")
+        add_log(update.effective_chat.id, update.effective_user.id, "kick", target.id)
+    except Exception as e:
+        update.message.reply_text("Failed to kick: " + str(e))
+
+# ---------- promote/demote ----------
+@require_admin
+def promote_cmd(update: Update, context: CallbackContext):
+    if not update.message.reply_to_message:
+        update.message.reply_text("Reply to the user you want to promote.")
+        return
+    target = update.message.reply_to_message.from_user
+    try:
+        context.bot.promote_chat_member(update.effective_chat.id, target.id,
+                                       can_change_info=True, can_delete_messages=True,
+                                       can_invite_users=True, can_restrict_members=True,
+                                       can_pin_messages=True, can_promote_members=False)
+        update.message.reply_text(f"{target.full_name} promoted to admin (limited).")
+        add_log(update.effective_chat.id, update.effective_user.id, "promote", target.id)
+    except Exception as e:
+        update.message.reply_text("Failed to promote: " + str(e))
+
+@require_admin
+def demote_cmd(update: Update, context: CallbackContext):
+    if not update.message.reply_to_message:
+        update.message.reply_text("Reply to the admin you want to demote.")
+        return
+    target = update.message.reply_to_message.from_user
+    try:
+        context.bot.promote_chat_member(update.effective_chat.id, target.id,
+                                       can_change_info=False, can_delete_messages=False,
+                                       can_invite_users=False, can_restrict_members=False,
+                                       can_pin_messages=False, can_promote_members=False,
+                                       is_anonymous=False)
+        update.message.reply_text(f"{target.full_name} demoted.")
+        add_log(update.effective_chat.id, update.effective_user.id, "demote", target.id)
+    except Exception as e:
+        update.message.reply_text("Failed to demote: " + str(e))
+
+# ---------- pin/unpin/purge ----------
+@require_admin
+def pin_cmd(update: Update, context: CallbackContext):
+    if not update.message.reply_to_message:
+        update.message.reply_text("Reply to a message to pin it.")
+        return
+    try:
+        context.bot.pin_chat_message(update.effective_chat.id, update.message.reply_to_message.message_id)
+        update.message.reply_text("Message pinned.")
+        add_log(update.effective_chat.id, update.effective_user.id, "pin", update.message.reply_to_message.from_user.id)
+    except Exception as e:
+        update.message.reply_text("Failed to pin: " + str(e))
+
+@require_admin
+def unpin_cmd(update: Update, context: CallbackContext):
+    try:
+        context.bot.unpin_chat_message(update.effective_chat.id)
+        update.message.reply_text("Unpinned.")
+        add_log(update.effective_chat.id, update.effective_user.id, "unpin")
+    except Exception as e:
+        update.message.reply_text("Failed to unpin: " + str(e))
+
+@require_admin
+def purge_cmd(update: Update, context: CallbackContext):
+    if not context.args:
+        update.message.reply_text("Usage: /purge <N>")
+        return
+    n = int(context.args[0])
+    msgs = []
+    for m in context.bot.get_chat(update.effective_chat.id).get_history(limit=n+1):
+        try:
+            context.bot.delete_message(update.effective_chat.id, m.message_id)
+        except Exception:
+            pass
+    update.message.reply_text(f"Attempted to delete last {n} messages.")
+    add_log(update.effective_chat.id, update.effective_user.id, "purge", None, f"{n} messages")
+
+# ---------- logs / setlog ----------
+@require_admin
+def setlog_cmd(update: Update, context: CallbackContext):
+    if not context.args:
+        update.message.reply_text("Usage: /setlog <chat_id or @channel>")
+        return
+    target = context.args[0]
+    set_setting(update.effective_chat.id, "log_chat", target)
+    update.message.reply_text(f"Log channel set to {target}")
+    add_log(update.effective_chat.id, update.effective_user.id, "set_log", None, target)
+
+def logs_cmd(update: Update, context: CallbackContext):
+    n = int(context.args[0]) if context.args else 10
+    rows = get_logs(update.effective_chat.id, n)
+    if not rows:
+        update.message.reply_text("No logs.")
+        return
+    txt = "Last logs:\n"
+    for r in rows:
+        ts = datetime.fromtimestamp(r[4]).strftime("%Y-%m-%d %H:%M")
+        txt += f"{r[1]} by {r[0]} -> target {r[2]} ({r[3]}) at {ts}\n"
+    update.message.reply_text(txt)
+
+# ---------- restrict / allow ----------
+@require_admin
+def restrict_cmd(update: Update, context: CallbackContext):
+    if not update.message.reply_to_message:
+        update.message.reply_text("Reply to user to restrict.")
+        return
+    target = update.message.reply_to_message.from_user
+    perms = ChatPermissions(can_send_messages=False, can_send_media_messages=False, can_add_web_page_previews=False)
+    try:
+        context.bot.restrict_chat_member(update.effective_chat.id, target.id, perms)
+        update.message.reply_text(f"{target.full_name} restricted.")
+        add_log(update.effective_chat.id, update.effective_user.id, "restrict", target.id)
+    except Exception as e:
+        update.message.reply_text("Failed to restrict: " + str(e))
+
+@require_admin
+def allow_cmd(update: Update, context: CallbackContext):
+    if not update.message.reply_to_message:
+        update.message.reply_text("Reply to user to allow.")
+        return
+    target = update.message.reply_to_message.from_user
+    perms = ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_add_web_page_previews=True)
+    try:
+        context.bot.restrict_chat_member(update.effective_chat.id, target.id, perms)
+        update.message.reply_text(f"{target.full_name} allowed.")
+        add_log(update.effective_chat.id, update.effective_user.id, "allow", target.id)
+    except Exception as e:
+        update.message.reply_text("Failed to allow: " + str(e))
+
+# ---------- report ----------
+def report_cmd(update: Update, context: CallbackContext):
+    if not update.message.reply_to_message:
+        update.message.reply_text("Reply to the message of the user you want to report, or use /report @user reason")
+        return
+    target = update.message.reply_to_message.from_user
+    reason = ' '.join(context.args) if context.args else "Reported via reply"
+    add_log(update.effective_chat.id, update.effective_user.id, "report", target.id, reason)
+    update.message.reply_text("Report submitted to admins.")
+    # Optionally notify log chat
+    welcome, rules, log_chat = get_setting(update.effective_chat.id)
+    if log_chat:
+        try:
+            context.bot.send_message(log_chat, f"Report in {update.effective_chat.title}: {update.effective_user.full_name} reported {target.full_name}: {reason}")
+        except Exception:
+            pass
+
+# ---------- clean bot messages ----------
+@require_admin
+def clean_cmd(update: Update, context: CallbackContext):
+    if not update.message.reply_to_message:
+        update.message.reply_text("Reply to a bot message or the start of range to clean.")
+        return
+    start_id = update.message.reply_to_message.message_id
+    cur_id = update.message.message_id
+    deleted = 0
+    for mid in range(start_id, cur_id + 1):
+        try:
+            context.bot.delete_message(update.effective_chat.id, mid)
+            deleted += 1
+        except Exception:
+            pass
+    update.message.reply_text(f"Deleted up to {deleted} messages (some may be protected).")
+    add_log(update.effective_chat.id, update.effective_user.id, "clean", None, f"deleted {deleted}")
+
+# ---------- Handlers registration ----------
+def run_bot():
+    updater = Updater(TOKEN, use_context=True)
+    dp: Dispatcher = updater.dispatcher
+
+    # basic
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("help", help_cmd))
+    dp.add_handler(CommandHandler("ping", ping))
+
+    # settings
+    dp.add_handler(CommandHandler("setwelcome", save_welcome))
+    dp.add_handler(CommandHandler("delwelcome", del_welcome))
+    dp.add_handler(CommandHandler("setrules", set_rules))
+    dp.add_handler(CommandHandler("showrules", show_rules))
+    dp.add_handler(MessageHandler(Filters.status_update.new_chat_members, new_member_welcome))
+
+    # warnings
+    dp.add_handler(CommandHandler("warn", warn_user))
+    dp.add_handler(CommandHandler("warnings", warnings_cmd))
+    dp.add_handler(CommandHandler("clearwarns", clear_warnings_cmd))
+
+    # mute/ban/etc
+    dp.add_handler(CommandHandler("mute", mute_cmd))
+    dp.add_handler(CommandHandler("unmute", unmute_cmd))
+    dp.add_handler(CommandHandler("tempmute", tempmute_cmd))
+    dp.add_handler(CommandHandler("ban", ban_cmd))
+    dp.add_handler(CommandHandler("unban", unban_cmd))
+    dp.add_handler(CommandHandler("tempban", tempban_cmd))
+    dp.add_handler(CommandHandler("kick", kick_cmd))
+
+    # admin management
+    dp.add_handler(CommandHandler("promote", promote_cmd))
+    dp.add_handler(CommandHandler("demote", demote_cmd))
+
+    # pin/purge
+    dp.add_handler(CommandHandler("pin", pin_cmd))
+    dp.add_handler(CommandHandler("unpin", unpin_cmd))
+    dp.add_handler(CommandHandler("purge", purge_cmd))
+
+    # logs
+    dp.add_handler(CommandHandler("setlog", setlog_cmd))
+    dp.add_handler(CommandHandler("logs", logs_cmd))
+
+    # restrict
+    dp.add_handler(CommandHandler("restrict", restrict_cmd))
+    dp.add_handler(CommandHandler("allow", allow_cmd))
+
+    # report
+    dp.add_handler(CommandHandler("report", report_cmd))
+
+    # cleaning
+    dp.add_handler(CommandHandler("clean", clean_cmd))
+
+    # start polling
+    logger.info("Starting bot polling thread...")
+    updater.start_polling()
+    updater.idle()
+
+# ---------- Flask keep-alive ----------
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return jsonify({"status": "ok", "time": datetime.utcnow().isoformat()})
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "healthy"})
+
+# start bot in background thread when module starts
+def start_background():
+    t = threading.Thread(target=run_bot, daemon=True)
+    t.start()
 
 if __name__ == "__main__":
-    main()
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable missing.")
+    start_background()
+    # run flask
+    app.run(host="0.0.0.0", port=PORT)
