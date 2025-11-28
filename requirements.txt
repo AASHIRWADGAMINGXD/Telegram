@@ -1,4 +1,2 @@
-python-telegram-bot==13.15
-imghdr3
-Flask
-gunicorn
+flask==3.0.3
+python-telegram-bot==20.7
