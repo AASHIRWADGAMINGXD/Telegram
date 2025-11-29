@@ -8,7 +8,7 @@ from aiohttp import web  # lightweight async web server for status page
 from telegram import ChatPermissions, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, filters
 
-API_TOKEN = "YOUR_BOT_TOKEN"
+API_TOKEN = "8241339356:AAGGgdBAP2lD69NC-44wWxnZ1MsZXTYVJaM"
 DB = "bot.db"
 WARN_THRESHOLD = 3
 
