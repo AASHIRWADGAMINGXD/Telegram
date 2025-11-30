@@ -1,11 +1,11 @@
-from flask import Flask  # <--- Note the capital 'F'
+from flask import Flask
 from threading import Thread
 
-app = Flask('')  # <--- Note the capital 'F' here too
+app = Flask('')
 
 @app.route('/')
 def home():
-    return "I am alive"
+    return "<h1>Bot Zinda Hai Bhai! (System Online)</h1>"
 
 def run():
     app.run(host='0.0.0.0', port=8080)
