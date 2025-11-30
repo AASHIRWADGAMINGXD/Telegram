@@ -1,6 +1,10 @@
 import os
 from telegram import Update, ChatPermissions
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+)
 from flask import Flask
 from threading import Thread
 
@@ -20,67 +24,65 @@ def keep_alive():
     t = Thread(target=run_server)
     t.start()
 
-
 # ------------------------
 # BOT CONFIG
 # ------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-PASSWORD = os.getenv("BOT_PASSWORD", "12345")  # default password
+PASSWORD = os.getenv("BOT_PASSWORD", "12345")
 
-logged_in_users = set()  # store user_ids who logged in
+logged_in_users = set()
 
 
 # ------------------------
-# HELP / START
+# START
 # ------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Namaste bhai! Bot ready hai.\n"
-        "Login ke liye: /login <password>"
+        "Namaste bhai. Login ke liye /login <password> bhejo."
     )
 
 
 # ------------------------
-# LOGIN SYSTEM
+# LOGIN
 # ------------------------
 async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    args = context.args
 
-    if len(args) == 0:
-        return await update.message.reply_text("Password daalo bhai: /login <password>")
+    if len(context.args) == 0:
+        return await update.message.reply_text(
+            "Password daalna padta bhai. Example: /login 12345"
+        )
 
-    if args[0] == PASSWORD:
+    if context.args[0] == PASSWORD:
         logged_in_users.add(user_id)
-        return await update.message.reply_text("Sahi password! Aap login ho gaye ho bhai.")
+        await update.message.reply_text("Sahi password bhai. Aap login ho gaye.")
     else:
-        return await update.message.reply_text("Galat password hai dost.")
+        await update.message.reply_text("Galat password bhai.")
 
 
 # ------------------------
-# CHECK ADMIN + LOGIN
+# ADMIN CHECK
 # ------------------------
 async def is_admin(update: Update):
-    chat_admins = await update.effective_chat.get_administrators()
-    admin_ids = [admin.user.id for admin in chat_admins]
+    admins = await update.effective_chat.get_administrators()
+    admin_ids = [a.user.id for a in admins]
     return update.effective_user.id in admin_ids
 
 
 def require_login(func):
-    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if user_id not in logged_in_users:
-            return await update.message.reply_text("Bhai pehle login karo: /login <password>")
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id not in logged_in_users:
+            return await update.message.reply_text("Pehle login karo bhai.")
         return await func(update, context)
-    return wrapped
+    return wrapper
 
 
 def require_admin(func):
-    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await is_admin(update):
-            return await update.message.reply_text("Ye command sirf admins ke liye hai bhai.")
+            return await update.message.reply_text("Ye command admin ke liye hai bhai.")
         return await func(update, context)
-    return wrapped
+    return wrapper
 
 
 # ------------------------
@@ -89,37 +91,36 @@ def require_admin(func):
 @require_login
 @require_admin
 async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("User mention karo ya ID do bhai.")
+    if len(context.args) == 0:
+        return await update.message.reply_text("User ID do bhai. Example: /kick 12345")
 
     user_id = int(context.args[0])
     try:
         await update.effective_chat.ban_member(user_id)
-        await update.message.reply_text("User ko nikal diya bhai.")
+        await update.message.reply_text("User ko group se nikal diya bhai.")
     except:
-        await update.message.reply_text("Nikalne me problem aa rahi hai bhai.")
+        await update.message.reply_text("User ko kick nahi kar paaya bhai.")
 
 
 # ------------------------
-# CLEAR (DELETE MESSAGES)
+# CLEAR MESSAGES
 # ------------------------
 @require_login
 @require_admin
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         count = int(context.args[0]) if context.args else 10
-
         chat = update.effective_chat
-        messages = []
+
         async for msg in chat.get_history(limit=count):
-            messages.append(msg.message_id)
+            try:
+                await chat.delete_message(msg.message_id)
+            except:
+                pass
 
-        for m in messages:
-            await chat.delete_message(m)
-
-        await update.message.reply_text("Chat saaf kar diya bhai.")
+        await update.message.reply_text("Messages saaf kar diye bhai.")
     except:
-        await update.message.reply_text("Clear command me kuch issue aa gaya bhai.")
+        await update.message.reply_text("Clear command me dikkat aa gayi.")
 
 
 # ------------------------
@@ -133,22 +134,25 @@ async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = int(context.args[0])
     minutes = int(context.args[1])
-
     try:
         permissions = ChatPermissions(can_send_messages=False)
         await update.effective_chat.restrict_member(
-            user_id, permissions, until_date=minutes * 60
+            user_id,
+            permissions,
+            until_date=minutes * 60
         )
-        await update.message.reply_text(f"User ko {minutes} minute ke liye mute kar diya bhai.")
+        await update.message.reply_text(
+            f"User ko {minutes} minute ke liye mute kar diya bhai."
+        )
     except:
-        await update.message.reply_text("Mute karne me dikkat aa rahi hai bhai.")
+        await update.message.reply_text("Mute karne me dikkat aa gayi.")
 
 
 # ------------------------
-# MAIN
+# MAIN FUNCTION (PTB v20)
 # ------------------------
-def main():
-    keep_alive()  # start keep-alive server
+async def main():
+    keep_alive()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -158,9 +162,13 @@ def main():
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("mute", mute))
 
-    print("Bot running...")
-    app.run_polling()
+    print("Bot started on Render")
+    await app.run_polling()
 
 
+# ------------------------
+# ENTRY POINT
+# ------------------------
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
