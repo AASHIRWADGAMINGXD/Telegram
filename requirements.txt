@@ -1,4 +1,2 @@
-python-telegram-bot==20.7
-aiohttp==3.9.5
-Flask==3.0.2
-gunicorn==21.2.0
+python-telegram-bot==20.7 
+flask
