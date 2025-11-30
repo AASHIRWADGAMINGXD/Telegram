@@ -1,295 +1,368 @@
 import os
 import logging
 import asyncio
-from telegram import Update, ChatPermissions
+import random
+from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, filters
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, filters
 from keep_alive import keep_alive
 
-# --- LOGGING SETUP ---
+# --- LOGGING ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 
-# --- CONFIG & VARIABLES ---
+# --- CONFIG ---
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASS", "BhaiKaSystem")
 
-# Database (Temporary RAM mein)
-authorized_users = set() # Logged in temporary admins
-warns = {} # User warnings count
+# --- DATA ---
+authorized_users = set()
+warns = {}
 
 # --- HELPER: CHECK POWER ---
 async def check_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
     
-    # 1. Check if user is the Owner/Admin in Telegram
-    member = await context.bot.get_chat_member(chat.id, user.id)
-    if member.status in ['creator', 'administrator']:
-        return True
+    # Check Temporary Login
+    if user.id in authorized_users: return True
+    
+    # Check Real Admin
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        if member.status in ['creator', 'administrator']: return True
+    except: pass
         
-    # 2. Check if logged in via Password
-    if user.id in authorized_users:
-        return True
-        
-    await update.message.reply_text("✋ **Ruk ja chotu!** Tere paas power nahi hai.")
+    await update.message.reply_text("✋ **Ruk ja lala!** Tu Admin nahi hai.")
     return False
 
-# --- 1. BASIC COMMANDS ---
+async def is_admin(chat_id, user_id, context):
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return member.status in ['creator', 'administrator'] or user_id in authorized_users
+    except: return False
+
+# --- 1. MODERATION UPGRADED ---
+
+# /shout - Improved
+async def shout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_auth(update, context): return
+    
+    msg = " ".join(context.args)
+    if not msg: return await update.message.reply_text("Are bhai likhna kya hai? `/shout Hello`")
+    
+    # Delete commander's message for cleanliness
+    try: await update.message.delete()
+    except: pass
+    
+    formatted_msg = f"📢 **SYSTEM KA AILAAN!** 📢\n\n👉 {msg}\n\n~ *{update.effective_user.first_name}*"
+    await context.bot.send_message(update.effective_chat.id, formatted_msg, parse_mode=ParseMode.MARKDOWN)
+
+# /warn - Smart (No Self/Admin Warn)
+async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_auth(update, context): return
+    if not update.message.reply_to_message: return await update.message.reply_text("Reply karke warn de bhai.")
+    
+    target = update.message.reply_to_message.from_user
+    chat_id = update.effective_chat.id
+    bot_id = context.bot.id
+
+    # SELF PROTECTION & ADMIN PROTECTION
+    if target.id == bot_id:
+        return await update.message.reply_text("😡 **Mazaak hai kya?** Main khud ko warn nahi dunga.")
+    
+    if await is_admin(chat_id, target.id, context):
+        return await update.message.reply_text("❌ **Galti!** Wo Admin hai, usko warn nahi de sakte.")
+
+    if chat_id not in warns: warns[chat_id] = {}
+    if target.id not in warns[chat_id]: warns[chat_id][target.id] = 0
+    
+    warns[chat_id][target.id] += 1
+    count = warns[chat_id][target.id]
+    
+    await update.message.reply_text(f"⚠️ **Oye {target.first_name}!** Sudhar ja.\nWarning: {count}/3")
+    
+    if count >= 3:
+        try:
+            await context.bot.ban_chat_member(chat_id, target.id)
+            warns[chat_id][target.id] = 0
+            await update.message.reply_text(f"🚫 **Khatam!** {target.first_name} ko 3 warnings ke baad uda diya.")
+        except: await update.message.reply_text("❌ Error: Banda power mein hai, ban nahi hua.")
+
+# /nuke - With Confirmation Button
+async def nuke_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_auth(update, context): return
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Udado Sab", callback_data='nuke_yes'),
+            InlineKeyboardButton("❌ Ruk Jao", callback_data='nuke_no')
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("☢️ **WARNING:** Bhai tu pichle 100 messages udaane wala hai. Soch le!", reply_markup=reply_markup)
+
+async def nuke_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    # Check if clicker is admin
+    if not await is_admin(query.message.chat.id, query.from_user.id, context):
+        return await query.answer("Tu mat chhu button!", show_alert=True)
+
+    if query.data == 'nuke_yes':
+        await query.edit_message_text("💥 **BOOM!** Safayi shuru...")
+        # Delete 100 messages
+        chat_id = query.message.chat_id
+        msg_id = query.message.message_id
+        for i in range(100):
+            try: await context.bot.delete_message(chat_id, msg_id - i)
+            except: pass
+        msg = await context.bot.send_message(chat_id, "☢️ **Area Clear!** Radiation level normal.")
+        await asyncio.sleep(5)
+        await msg.delete()
+    else:
+        await query.edit_message_text("😌 **Bach gaye!** Nuke cancel kar diya.")
+
+# --- 2. NEW FUN & UTILITY FEATURES (10+) ---
+
+# 1. /roast - Beizzati
+async def roast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    insults = [
+        "Shakal dekh ke lagta hai bhagwan ne 'Rough Draft' save kar diya.",
+        "Tere dimaag mein akal nahi, sirf 'Loading...' ka circle ghoomta hai.",
+        "Bhai tu paida hua tha ya download hua tha?",
+        "Jitna tu bolta hai, utna agar sochta toh aaj NASA mein hota.",
+        "Tera IQ room temperature se bhi kam hai.",
+        "Tujhe dekh ke lagta hai evolution abhi complete nahi hua."
+    ]
+    target = update.message.reply_to_message.from_user if update.message.reply_to_message else update.effective_user
+    await update.message.reply_text(f"🔥 **{target.first_name}**, {random.choice(insults)}")
+
+# 2. /dp - Profile Pic Stealer
+async def get_dp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    target = update.message.reply_to_message.from_user if update.message.reply_to_message else update.effective_user
+    photos = await target.get_profile_photos(limit=1)
+    if not photos.total_count:
+        return await update.message.reply_text("❌ Isne DP chupa rakhi hai ya hai hi nahi.")
+    await update.message.reply_photo(photos.photos[0][-1].file_id, caption=f"📸 Ye le **{target.first_name}** ki DP.")
+
+# 3. /slap - Fun Action
+async def slap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message: return await update.message.reply_text("Kisko maarna hai? Reply kar.")
+    attacker = update.effective_user.first_name
+    victim = update.message.reply_to_message.from_user.first_name
+    await update.message.reply_text(f"👋 **DHADAAAAM!**\n{attacker} ne {victim} ke kaan ke neeche bajaya!")
+
+# 4. /toss - Coin Flip
+async def toss(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result = random.choice(["Heads 🪙", "Tails 🦅"])
+    await update.message.reply_text(f"Sikka uchhal diya hai...\n👉 **{result}** aaya hai!")
+
+# 5. /report - Snitch to Admins
+async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message: return await update.message.reply_text("Reply karke `/report` likh.")
+    chat_name = update.effective_chat.title
+    user = update.effective_user.first_name
+    reported_user = update.message.reply_to_message.from_user.first_name
+    msg_link = f"https://t.me/c/{str(update.effective_chat.id)[4:]}/{update.message.reply_to_message.message_id}"
+    
+    # Send generic alert
+    await update.message.reply_text("👮‍♂️ **Report Bhej Di!** Admins check kar lenge.")
+    
+    # Tag Admins (Bot functionality to notify admins)
+    admins = await context.bot.get_chat_administrators(update.effective_chat.id)
+    admin_text = f"🚨 **REPORT ALERT** in {chat_name}\n👤 Reporter: {user}\n😈 Culprit: {reported_user}\n🔗 Message: [Link]({msg_link})"
+    
+    for admin in admins:
+        if not admin.user.is_bot:
+            try: await context.bot.send_message(admin.user.id, admin_text, parse_mode=ParseMode.MARKDOWN)
+            except: pass # Can't DM admin if they haven't started bot
+
+# 6. /stats - Group Info
+async def chat_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    members = await context.bot.get_chat_member_count(chat.id)
+    await update.message.reply_text(f"📊 **Group Stats:**\n\n📛 Naam: {chat.title}\n👥 Members: {members}\n🆔 ID: `{chat.id}`", parse_mode=ParseMode.MARKDOWN)
+
+# 7. /roll - Dice
+async def roll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await context.bot.send_dice(update.effective_chat.id)
+    await asyncio.sleep(3)
+    await update.message.reply_text(f"🎲 Number **{msg.dice.value}** aaya hai!")
+
+# 8. /welcome - Fake Welcome (Manual)
+async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message: return
+    new_user = update.message.reply_to_message.from_user.first_name
+    await update.message.reply_text(f"🎉 **Swagat hai {new_user}!**\nChappal bahar utaar ke aana group mein. Mauj kar! 🥳")
+
+# 9. /invitelink - Link Generator
+async def invite_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_auth(update, context): return
+    link = await context.bot.export_chat_invite_link(update.effective_chat.id)
+    await update.message.reply_text(f"🔗 **Ye le Link:**\n{link}")
+
+# 10. /joke - Random Joke
+async def joke(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    jokes = [
+        "Teacher: 'M' se meaning batao?\nStudent: Main hoon na!\nTeacher: 'T' se?\nStudent: Tu hai kaun? 😂",
+        "Pappu: Papa, mujhe shaadi nahi karni.\nPapa: Kyun?\nPappu: Sab ladkiya aapse maangti hai paise, mujhe sharam aati hai! 🤣",
+        "Zindagi mein do hi log khush hai:\nEk wo jise koi nahi jaanta,\nAur dusra wo jo kisi ki nahi sunta. 😎"
+    ]
+    await update.message.reply_text(f"😂 **Joke:**\n{random.choice(jokes)}")
+
+# --- OLD FEATURES (Standard) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🙏 **Namaste Bhai!**\nMain hoon Group Manager Pro.\n\n"
-        "📜 **Features:**\n"
-        "• `/help` - Sab commands dekhne ke liye\n"
-        "• `/login [pass]` - Admin banne ke liye"
-    )
+    await update.message.reply_text("🙏 **Namaste!**\nGangster Bot Online hai.\nCommands ke liye `/help` dabao.")
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = """
-🔥 **Bhai Ka Menu (20+ Features):**
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = """
+💀 **BHAI KA MENU** 💀
 
-**👮‍♂️ Moderation:**
-/kick - Bahar feko
-/ban - Hamesha ke liye bye
-/unban - Maaf kiya
-/mute - Muh band
-/unmute - Muh khola
-/warn - Warning de (3 pe ban)
-/resetwarn - Warning hata
-/pin - Message chipka de
-/unpin - Pin hata de
-/lock - Chat band (Sirf admin)
-/unlock - Chat chalu
-/clear [num] - Message uda de
-/nuke - Sab saaf (Last 100)
+**👮 Admin Power:**
+/kick, /ban, /unban, /mute, /unmute
+/warn (Smart System)
+/nuke (With Confirmation)
+/shout (Announcement)
+/pin, /unpin
+/lock, /unlock
+/clear [num]
+
+**🎭 Fun & Gang:**
+/roast - Beizzati
+/slap - Chamat
+/dp - Photo churao
+/toss - Sikka
+/roll - Ludo dice
+/joke - Hasi mazaak
+/report - Shikayat karo
+/stats - Group info
+/welcome - Swagat
 
 **⚙️ System:**
-/login [pass] - Password access
-/logout - Access khatam
-/admin - Check power
-/id - User/Chat ID
-/info - User ki kundali
-/staff - Admins ki list
-/shout - Announcement
-/ping - Bot speed check
+/login [pass], /logout
 """
-    await update.message.reply_text(help_text)
+    await update.message.reply_text(text)
 
-# --- 2. AUTH SYSTEM ---
 async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args: return await update.message.reply_text("Pass toh daal bhai! `/login [pass]`")
     if context.args[0] == ADMIN_PASSWORD:
         authorized_users.add(update.effective_user.id)
-        await update.message.reply_text("😎 **Access Granted!** Ab tu Boss hai.")
+        await update.message.reply_text("😎 **Access Granted!** Power aa gayi.")
     else:
-        await update.message.reply_text("🤨 **Galat Password!** Nikal pehli fursat mein.")
+        await update.message.reply_text("🤨 **Chal nikal!** Galat password.")
 
-async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id in authorized_users:
-        authorized_users.remove(update.effective_user.id)
-        await update.message.reply_text("👋 **Logged Out!** Power wapas le li gayi hai.")
-    else:
-        await update.message.reply_text("Tu pehle se hi logged out hai bhai.")
-
-# --- 3. KICK & BAN ---
 async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update, context): return
-    if not update.message.reply_to_message: return await update.message.reply_text("Reply karke bol kisko udana hai.")
-    
-    user = update.message.reply_to_message.from_user
+    if not update.message.reply_to_message: return
     try:
-        await context.bot.ban_chat_member(update.effective_chat.id, user.id)
-        await context.bot.unban_chat_member(update.effective_chat.id, user.id) # Unban immediately just to kick
-        await update.message.reply_text(f"🦶 **Kick!** {user.first_name} ko hawa mein uda diya.")
-    except: await update.message.reply_text("❌ Error: Ye banda mujhse taqatwar hai.")
+        await context.bot.ban_chat_member(update.effective_chat.id, update.message.reply_to_message.from_user.id)
+        await context.bot.unban_chat_member(update.effective_chat.id, update.message.reply_to_message.from_user.id)
+        await update.message.reply_text("🦶 **Kick!** Bahar fek diya.")
+    except: await update.message.reply_text("❌ Error.")
 
 async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update, context): return
-    if not update.message.reply_to_message: return await update.message.reply_text("Reply kar bhai.")
-    user = update.message.reply_to_message.from_user
+    if not update.message.reply_to_message: return
     try:
-        await context.bot.ban_chat_member(update.effective_chat.id, user.id)
-        await update.message.reply_text(f"🔨 **Ban Hammer!** {user.first_name}, ab tu kabhi wapas nahi aayega.")
-    except: await update.message.reply_text("❌ Admin ko ban nahi kar sakta.")
+        await context.bot.ban_chat_member(update.effective_chat.id, update.message.reply_to_message.from_user.id)
+        await update.message.reply_text("🔨 **Banned!** Ab nahi dikhega.")
+    except: await update.message.reply_text("❌ Error.")
 
 async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update, context): return
-    if not context.args: return await update.message.reply_text("User ID de bhai unban karne ke liye.")
+    if not context.args: return
     try:
         await context.bot.unban_chat_member(update.effective_chat.id, int(context.args[0]))
-        await update.message.reply_text("😇 **Maaf kiya!** Banda wapas aa sakta hai.")
-    except: await update.message.reply_text("❌ ID galat hai ya banda banned nahi hai.")
+        await update.message.reply_text("😇 **Unbanned!**")
+    except: pass
 
-# --- 4. MUTE SYSTEM ---
 async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update, context): return
-    if not update.message.reply_to_message: return await update.message.reply_text("Kisko chup karana hai? Reply kar.")
-    user = update.message.reply_to_message.from_user
+    if not update.message.reply_to_message: return
     try:
-        permissions = ChatPermissions(can_send_messages=False)
-        await context.bot.restrict_chat_member(update.effective_chat.id, user.id, permissions=permissions)
-        await update.message.reply_text(f"🤐 **Shhh!** {user.first_name} ke muh pe tape laga diya.")
-    except: await update.message.reply_text("❌ Error aagaya.")
+        perms = ChatPermissions(can_send_messages=False)
+        await context.bot.restrict_chat_member(update.effective_chat.id, update.message.reply_to_message.from_user.id, permissions=perms)
+        await update.message.reply_text("🤐 **Muted!**")
+    except: pass
 
 async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update, context): return
-    if not update.message.reply_to_message: return await update.message.reply_text("Reply kar bhai.")
-    user = update.message.reply_to_message.from_user
-    try:
-        permissions = ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True)
-        await context.bot.restrict_chat_member(update.effective_chat.id, user.id, permissions=permissions)
-        await update.message.reply_text(f"🗣️ **Bol sakta hai!** {user.first_name}, shuru ho ja.")
-    except: await update.message.reply_text("❌ Error.")
-
-# --- 5. WARNING SYSTEM ---
-async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_auth(update, context): return
-    if not update.message.reply_to_message: return await update.message.reply_text("Reply to kar!")
-    
-    user = update.message.reply_to_message.from_user
-    chat_id = update.effective_chat.id
-    
-    if chat_id not in warns: warns[chat_id] = {}
-    if user.id not in warns[chat_id]: warns[chat_id][user.id] = 0
-    
-    warns[chat_id][user.id] += 1
-    count = warns[chat_id][user.id]
-    
-    await update.message.reply_text(f"⚠️ **Warning {count}/3!** Sudhar ja {user.first_name}!")
-    
-    if count >= 3:
-        try:
-            await context.bot.ban_chat_member(chat_id, user.id)
-            warns[chat_id][user.id] = 0
-            await update.message.reply_text(f"🚫 **Limit Cross!** 3 warnings ho gayi, {user.first_name} gaya kaam se.")
-        except: await update.message.reply_text("❌ Ban karne mein fail ho gaya.")
-
-async def reset_warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_auth(update, context): return
     if not update.message.reply_to_message: return
-    user = update.message.reply_to_message.from_user
-    if update.effective_chat.id in warns and user.id in warns[update.effective_chat.id]:
-        warns[update.effective_chat.id][user.id] = 0
-    await update.message.reply_text(f"♻️ **Reset!** {user.first_name} ki warnings clear kar di.")
+    try:
+        perms = ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True)
+        await context.bot.restrict_chat_member(update.effective_chat.id, update.message.reply_to_message.from_user.id, permissions=perms)
+        await update.message.reply_text("🗣️ **Unmuted!**")
+    except: pass
 
-# --- 6. CHAT CLEANUP ---
-async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def clear_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update, context): return
     try:
         amount = int(context.args[0]) if context.args else 5
         msg_id = update.message.message_id
         chat_id = update.effective_chat.id
-        
-        # Simple loop deletion (safe method)
-        count = 0
         for i in range(amount + 1):
-            try:
-                await context.bot.delete_message(chat_id, msg_id - i)
-                count += 1
+            try: await context.bot.delete_message(chat_id, msg_id - i)
             except: pass
-        
-        status_msg = await context.bot.send_message(chat_id, f"🧹 **Safayi Complete!** {count-1} messages uda diye.")
-        await asyncio.sleep(3)
-        await status_msg.delete()
-    except ValueError: await update.message.reply_text("Number daal bhai.")
+        msg = await context.bot.send_message(chat_id, "🧹 **Saaf!**")
+        await asyncio.sleep(2)
+        await msg.delete()
+    except: pass
 
-async def nuke(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_auth(update, context): return
-    await update.message.reply_text("☢️ **NUKE START!** Sab uda raha hoon...")
-    # Calls clear internally for 100 messages
-    context.args = ["100"]
-    await clear(update, context)
-
-# --- 7. UTILITIES & FUN ---
 async def pin_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update, context): return
-    if not update.message.reply_to_message: return await update.message.reply_text("Reply kar jisko pin karna hai.")
-    try:
-        await update.message.reply_to_message.pin(disable_notification=False)
-        await update.message.reply_text("📌 **Chipka Diya!** Message pin ho gaya.")
-    except: await update.message.reply_text("❌ Pin nahi kar pa raha.")
+    if update.message.reply_to_message:
+        await update.message.reply_to_message.pin()
+        await update.message.reply_text("📌 **Pinned!**")
 
 async def unpin_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update, context): return
-    try:
-        await context.bot.unpin_chat_message(update.effective_chat.id)
-        await update.message.reply_text("📍 **Pin Removed!**")
-    except: pass
+    await context.bot.unpin_chat_message(update.effective_chat.id)
+    await update.message.reply_text("📍 **Unpinned!**")
 
-async def lock_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update, context): return
     perms = ChatPermissions(can_send_messages=False)
     await context.bot.set_chat_permissions(update.effective_chat.id, perms)
-    await update.message.reply_text("🔒 **Chat LOCKED!** Ab koi kuch nahi bolega. Shanti.")
+    await update.message.reply_text("🔒 **Chat LOCKED!**")
 
-async def unlock_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update, context): return
     perms = ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True)
     await context.bot.set_chat_permissions(update.effective_chat.id, perms)
-    await update.message.reply_text("🔓 **Chat UNLOCKED!** Chalo shuru ho jao.")
+    await update.message.reply_text("🔓 **Chat UNLOCKED!**")
 
-async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    reply_id = update.message.reply_to_message.from_user.id if update.message.reply_to_message else "N/A"
-    text = f"🆔 **IDs Information:**\n\n👤 **User ID:** `{user_id}`\n🏠 **Chat ID:** `{chat_id}`"
-    if reply_id != "N/A": text += f"\n👉 **Replied User ID:** `{reply_id}`"
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-async def user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.message.reply_to_message.from_user if update.message.reply_to_message else update.effective_user
-    text = (f"🕵️ **Jasoosi Report:**\n\n"
-            f"👤 **Naam:** {user.full_name}\n"
-            f"🆔 **ID:** `{user.id}`\n"
-            f"🤖 **Bot hai?** {'Haan' if user.is_bot else 'Nahi'}\n"
-            f"🔗 **Username:** @{user.username if user.username else 'Nahi hai'}")
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-async def shout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_auth(update, context): return
-    msg = " ".join(context.args)
-    if not msg: return await update.message.reply_text("Kya chilana hai? Likh toh sahi.")
-    await update.message.reply_text(f"📢 **AILAAN:**\n\n{msg}")
-
-async def staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admins = await context.bot.get_chat_administrators(update.effective_chat.id)
-    text = "👮‍♂️ **Group ke Dons (Admins):**\n"
-    for admin in admins:
-        text += f"• {admin.user.first_name}\n"
-    await update.message.reply_text(text)
-
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🏓 **Pong!** System full speed mein hai bhai.")
-
-# --- MAIN ---
+# --- EXECUTION ---
 if __name__ == '__main__':
-    keep_alive() # Start Flask
-    
+    keep_alive()
     if not TOKEN:
-        print("Error: Token nahi mila env mein!")
+        print("Error: TOKEN Missing")
         exit()
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Handlers Add Kar Raha Hoon
+    # Handlers List
     handlers = [
-        ('start', start), ('help', help_command),
-        ('login', login), ('logout', logout),
+        ('start', start), ('help', help_cmd), ('login', login),
         ('kick', kick), ('ban', ban), ('unban', unban),
         ('mute', mute), ('unmute', unmute),
-        ('warn', warn), ('resetwarn', reset_warn),
-        ('clear', clear), ('nuke', nuke),
-        ('pin', pin_msg), ('unpin', unpin_msg),
-        ('lock', lock_chat), ('unlock', unlock_chat),
-        ('id', get_id), ('info', user_info),
-        ('shout', shout), ('staff', staff),
-        ('ping', ping), ('admin', lambda u,c: check_auth(u,c))
+        ('warn', warn), ('nuke', nuke_ask), ('shout', shout),
+        ('clear', clear_chat), ('pin', pin_msg), ('unpin', unpin_msg),
+        ('lock', lock), ('unlock', unlock),
+        ('roast', roast), ('dp', get_dp), ('slap', slap),
+        ('toss', toss), ('roll', roll), ('stats', chat_stats),
+        ('report', report), ('welcome', welcome),
+        ('invitelink', invite_link), ('joke', joke)
     ]
 
     for cmd, func in handlers:
         app.add_handler(CommandHandler(cmd, func))
+    
+    # Callback Handler for Nuke Buttons
+    app.add_handler(CallbackQueryHandler(nuke_confirm, pattern='^nuke_'))
 
-    print("🤖 Bot Start! System set hai...")
+    print("🤖 Gangster Bot Started...")
     app.run_polling()
