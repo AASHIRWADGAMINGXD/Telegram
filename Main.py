@@ -1,144 +1,166 @@
-# Telegram Bot with /kick, /clean, /mute, and password authentication
-# Full Deployable Code for Render
-
 import os
-import time
-import asyncio
-import sqlite3
-from datetime import datetime, timedelta
 from telegram import Update, ChatPermissions
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from flask import Flask
+from threading import Thread
 
+# ------------------------
+# KEEP ALIVE SERVER (FOR RENDER)
+# ------------------------
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Bot Running..."
+
+def run_server():
+    app.run(host="0.0.0.0", port=8080)
+
+def keep_alive():
+    t = Thread(target=run_server)
+    t.start()
+
+
+# ------------------------
+# BOT CONFIG
+# ------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-AUTH_PASSWORD = os.getenv("AUTH_PASSWORD", "indianpower123")
-DB = "bot.db"
+PASSWORD = os.getenv("BOT_PASSWORD", "12345")  # default password
 
-# ---------------------- DATABASE SETUP ----------------------
-def init_db():
-    con = sqlite3.connect(DB)
-    cur = con.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS auth (
-        user_id INTEGER PRIMARY KEY,
-        is_verified INTEGER
-    )""")
-    con.commit(); con.close()
+logged_in_users = set()  # store user_ids who logged in
 
-def is_verified(user_id: int):
-    con = sqlite3.connect(DB)
-    cur = con.cursor()
-    cur.execute("SELECT is_verified FROM auth WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    con.close()
-    return row and row[0] == 1
 
-def verify_user(user_id: int):
-    con = sqlite3.connect(DB)
-    cur = con.cursor()
-    cur.execute("REPLACE INTO auth VALUES (?, 1)", (user_id,))
-    con.commit(); con.close()
-
-# ---------------------- COMMANDS ----------------------
+# ------------------------
+# HELP / START
+# ------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Namaste! 🙏\n" \
-        "Aapka swagat hai Indian Security Bot me!\n" \
-        "Aage badhne ke liye password type karein: /auth <password>"
+        "Namaste bhai! Bot ready hai.\n"
+        "Login ke liye: /login <password>"
     )
 
-async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Bhai password daalna padega! Format: /auth <password>")
-        return
 
-    if context.args[0] == AUTH_PASSWORD:
-        verify_user(update.effective_user.id)
-        await update.message.reply_text("Sahi pakde hain! ✔️ Authentication Successful 💪🇮🇳")
+# ------------------------
+# LOGIN SYSTEM
+# ------------------------
+async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    args = context.args
+
+    if len(args) == 0:
+        return await update.message.reply_text("Password daalo bhai: /login <password>")
+
+    if args[0] == PASSWORD:
+        logged_in_users.add(user_id)
+        return await update.message.reply_text("Sahi password! Aap login ho gaye ho bhai.")
     else:
-        await update.message.reply_text("Galat password bhai! Thoda dhyaan se likho 😭")
+        return await update.message.reply_text("Galat password hai dost.")
 
-async def clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat = update.effective_chat
 
-    if not is_verified(user.id):
-        await update.message.reply_text("Pehle authentication karo bhai! /auth <password>")
-        return
+# ------------------------
+# CHECK ADMIN + LOGIN
+# ------------------------
+async def is_admin(update: Update):
+    chat_admins = await update.effective_chat.get_administrators()
+    admin_ids = [admin.user.id for admin in chat_admins]
+    return update.effective_user.id in admin_ids
 
-    n = int(context.args[0]) if context.args else 20
-    deleted = 0
 
-    for msg_id in range(update.message.message_id - 1, update.message.message_id - n - 1, -1):
-        try:
-            await context.bot.delete_message(chat.id, msg_id)
-            deleted += 1
-        except:
-            pass
+def require_login(func):
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if user_id not in logged_in_users:
+            return await update.message.reply_text("Bhai pehle login karo: /login <password>")
+        return await func(update, context)
+    return wrapped
 
-    await update.message.reply_text(f"Khatam! 🚮 {deleted} messages uda diye boss 😎")
 
-async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+def require_admin(func):
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await is_admin(update):
+            return await update.message.reply_text("Ye command sirf admins ke liye hai bhai.")
+        return await func(update, context)
+    return wrapped
 
-    if not is_verified(user.id):
-        await update.message.reply_text("Pehle authentication karo bhai! /auth <password>")
-        return
 
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Kisko mute karna hai? Reply karke /mute karo bhai.")
-        return
-
-    target = update.message.reply_to_message.from_user
-
-    perms = ChatPermissions(can_send_messages=False)
-
-    try:
-        await context.bot.restrict_chat_member(
-            update.effective_chat.id, target.id, permissions=perms, until_date=datetime.utcnow() + timedelta(hours=1)
-        )
-        await update.message.reply_text(
-            f"{target.full_name} ko 1 ghanta ke liye chup kara diya! 🤐\n"
-            "Thoda shanti rakho bhai log. 🙏"
-        )
-    except:
-        await update.message.reply_text("Arre yeh banda nahi mute hota! Admin ya owner hoga 😭")
-
+# ------------------------
+# KICK USER
+# ------------------------
+@require_login
+@require_admin
 async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+    if not context.args:
+        return await update.message.reply_text("User mention karo ya ID do bhai.")
 
-    if not is_verified(user.id):
-        await update.message.reply_text("Pehle authentication karo bhai! /auth <password>")
-        return
+    user_id = int(context.args[0])
+    try:
+        await update.effective_chat.ban_member(user_id)
+        await update.message.reply_text("User ko nikal diya bhai.")
+    except:
+        await update.message.reply_text("Nikalne me problem aa rahi hai bhai.")
 
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Kisko kick karna hai? Reply karke bolo. /kick")
-        return
 
-    target = update.message.reply_to_message.from_user
+# ------------------------
+# CLEAR (DELETE MESSAGES)
+# ------------------------
+@require_login
+@require_admin
+async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        count = int(context.args[0]) if context.args else 10
+
+        chat = update.effective_chat
+        messages = []
+        async for msg in chat.get_history(limit=count):
+            messages.append(msg.message_id)
+
+        for m in messages:
+            await chat.delete_message(m)
+
+        await update.message.reply_text("Chat saaf kar diya bhai.")
+    except:
+        await update.message.reply_text("Clear command me kuch issue aa gaya bhai.")
+
+
+# ------------------------
+# MUTE USER
+# ------------------------
+@require_login
+@require_admin
+async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        return await update.message.reply_text("Use: /mute <user_id> <minutes>")
+
+    user_id = int(context.args[0])
+    minutes = int(context.args[1])
 
     try:
-        await context.bot.ban_chat_member(update.effective_chat.id, target.id)
-        await context.bot.unban_chat_member(update.effective_chat.id, target.id)
-
-        await update.message.reply_text(
-            f"{target.full_name} ko group se nikal diya bhai! 🚪👋\n"
-            "Baat khatam, paisa hazam 😎"
+        permissions = ChatPermissions(can_send_messages=False)
+        await update.effective_chat.restrict_member(
+            user_id, permissions, until_date=minutes * 60
         )
+        await update.message.reply_text(f"User ko {minutes} minute ke liye mute kar diya bhai.")
     except:
-        await update.message.reply_text("Bhai ye banda strong hai… admin lagta hai, nahi nikal sakta 😭")
+        await update.message.reply_text("Mute karne me dikkat aa rahi hai bhai.")
 
-# ---------------------- MAIN ----------------------
-async def main():
-    init_db()
+
+# ------------------------
+# MAIN
+# ------------------------
+def main():
+    keep_alive()  # start keep-alive server
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("auth", auth))
-    app.add_handler(CommandHandler("clean", clean))
+    app.add_handler(CommandHandler("login", login))
     app.add_handler(CommandHandler("kick", kick))
+    app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("mute", mute))
 
-    await app.run_polling()
+    print("Bot running...")
+    app.run_polling()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
