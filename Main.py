@@ -13,14 +13,13 @@ load_dotenv()
 TOKEN = os.getenv('BOT_TOKEN')
 BOT_PASSWORD = os.getenv('BOT_PASSWORD')
 
-# Logging setup (Errors dekhne ke liye)
+# Logging setup
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 bot = telebot.TeleBot(TOKEN)
 
-# --- DATABASE (JSON) ---
-# Auto-replies save karne ke liye
+# --- DATABASE (JSON) FIX ---
 AUTOREPLY_FILE = 'autoreply.json'
 
 def load_replies():
@@ -28,6 +27,9 @@ def load_replies():
         with open(AUTOREPLY_FILE, 'r') as f:
             return json.load(f)
     except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        # Agar file khali ya corrupt hai, to empty dictionary return karo
         return {}
 
 def save_replies(data):
@@ -37,7 +39,6 @@ def save_replies(data):
 auto_replies = load_replies()
 
 # --- TEMPORARY ADMIN LIST ---
-# Jo password dalega wo yahan aayega
 authorized_users = []
 
 # --- DESI CONTENT ---
@@ -57,7 +58,6 @@ roasts = [
 
 # --- HELPER FUNCTIONS ---
 def is_admin(message):
-    """Checks if user is Group Admin OR Logged in via Password"""
     user_id = message.from_user.id
     if user_id in authorized_users:
         return True
@@ -129,7 +129,7 @@ def clear_msgs(message):
     try:
         args = message.text.split()
         num = int(args[1]) if len(args) > 1 else 5
-        if num > 100: num = 100 # Safety limit
+        if num > 100: num = 100
         
         msg_ids = [message.message_id - i for i in range(num + 1)]
         for mid in msg_ids:
@@ -139,7 +139,9 @@ def clear_msgs(message):
         
         temp_msg = bot.send_message(message.chat.id, f"🧹 Safai Abhiyan! {num} messages delete kar diye.")
         time.sleep(3)
-        bot.delete_message(message.chat.id, temp_msg.message_id) # Delete notification too
+        try:
+            bot.delete_message(message.chat.id, temp_msg.message_id)
+        except: pass
     except:
         bot.reply_to(message, "Usage: `/clear 10`")
 
@@ -162,7 +164,6 @@ def unpin_msg(message):
 def nuke_chat(message):
     if not is_admin(message): return
     bot.send_message(message.chat.id, "☢️ ATOMIC BOMB LAUNCHED! (Deleting last 50 messages...)")
-    # Reuse clear logic slightly modified
     try:
         for i in range(50):
             try:
@@ -219,42 +220,31 @@ def roast_guy(message):
     target = message.reply_to_message.from_user.first_name if message.reply_to_message else message.from_user.first_name
     bot.send_message(message.chat.id, f"Oye {target}! {random.choice(roasts)} 🔥")
 
-# --- TEXT HANDLER (Auto Reply & Filters) ---
+# --- TEXT HANDLER ---
 @bot.message_handler(func=lambda message: True)
 def handle_text(message):
-    # 1. Check Auto Reply
+    if not message.text: return
     txt = message.text.lower()
     if txt in auto_replies:
         bot.reply_to(message, auto_replies[txt])
-    
-    # 2. Bad Words Filter (Basic)
-    bad_words = ["badword1", "badword2"] # Add gaalis here
-    if any(word in txt for word in bad_words):
-        bot.delete_message(message.chat.id, message.message_id)
-        bot.send_message(message.chat.id, f"{message.from_user.first_name}, gaali mat de saale! 😡")
 
-# --- MAIN EXECUTION (FIX FOR 409 CONFLICT) ---
+# --- MAIN EXECUTION ---
 if __name__ == "__main__":
     print("🤖 Bot Start ho raha hai...")
     
-    # 1. Webserver start karo (Render ke liye)
-    keep_alive()
+    keep_alive() # Web server start
     
-    # 2. Conflict Fixer: Purane webhooks hatao
+    # Remove old webhook to fix 409 conflict
     try:
         bot.remove_webhook()
-        time.sleep(1) # Thoda saans lene do server ko
+        time.sleep(1)
     except Exception as e:
-        print(f"Webhook remove error (Ignorable): {e}")
+        print(e)
 
-    # 3. Infinity Polling (Retry mechanism ke saath)
-    print("✅ Bot is Online via Long Polling!")
+    print("✅ Bot is Online!")
     while True:
         try:
-            # timeout=60 means connection stays open for 60s
-            # long_polling_timeout=5 ensures stability
             bot.infinity_polling(timeout=60, long_polling_timeout=5)
         except Exception as e:
-            print(f"⚠️ Connection toot gaya: {e}")
-            time.sleep(5) # 5 second ruko fir wapas try karo
-            print("🔄 Reconnecting...")
+            print(f"⚠️ Reconnecting... {e}")
+            time.sleep(5)
