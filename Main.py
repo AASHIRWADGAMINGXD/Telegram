@@ -18,7 +18,7 @@ SUPER_ADMIN_ID = 123456789  # Replace with your actual ID for testing admin comm
 
 # Simple Data Storage (In-memory - will reset on bot restart)
 # For production, use a database (MongoDB, PostgreSQL)
-PASSCODE = "Jalebi_Fafda" # The password for the /password command
+PASSCODE = "Loid_Twilight" # The password for the /password command
 ADMINS = {SUPER_ADMIN_ID}  # Set of User IDs
 MUTED_USERS = {} # {user_id: end_time_timestamp}
 AUTOREPLY_RULES = {} # {trigger_phrase: reply_text}
