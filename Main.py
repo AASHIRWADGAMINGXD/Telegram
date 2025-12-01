@@ -1,311 +1,570 @@
 import os
 import requests
 import asyncio
-from telegram import Update, error, ChatPermissions # 'ChatPermissions' import zaroori hai
+from telegram import Update, error
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --- 1. CONFIGURATION aur JANKAAR-KHANA (Data Structures) ---
+# --- 1. CONFIGURATION AND DATA STRUCTURES ---
 
-# Bot ki chabhi (Token) - Environment variable se uthana hai
-BOT_CHABHI = os.environ.get('BOT_TOKEN') 
-if not BOT_CHABHI:
-    print("🚨 GADBAD: BOT_TOKEN chabhi nahi mili. Code band.")
+# You must set this in your environment: export BOT_TOKEN='YOUR_ACTUAL_TOKEN'
+# For the bot to run: bot_token env
+BOT_TOKEN = os.environ.get('BOT_TOKEN') 
+if not BOT_TOKEN:
+    print("🚨 ERROR: BOT_TOKEN environment variable not set. Please set it to your bot's token.")
     exit(1)
 
-# Sabse bada BOSS ID (Apna ID yahan daalo)
-MAHA_BOSS_ID = 123456789  # <--- Yahan apna asli ID daalo
+# Super Admin ID (Change this to YOUR Telegram User ID)
+SUPER_ADMIN_ID = 123456789  # Replace with your actual ID for testing admin commands
 
-# Temporary Jankaar-khana (In-memory - restart hone par sab saaf ho jayega)
-RAAZ_SHABD = "Loid_Twilight" # Admin banne ka password
-BOSS_LOG = {MAHA_BOSS_ID}  # Admin IDs ka set
-SHAANT_KIE_GAYE_LOG = {} # {user_id: shaanti_ka_end_time}
-AUTO_JAWAAB_NIZAM = {} # {sawaal_trigger: jawab_text}
+# Simple Data Storage (In-memory - will reset on bot restart)
+# For production, use a database (MongoDB, PostgreSQL)
+PASSCODE = "Loid_Twilight" # The password for the /password command
+ADMINS = {SUPER_ADMIN_ID}  # Set of User IDs
+MUTED_USERS = {} # {user_id: end_time_timestamp}
+AUTOREPLY_RULES = {} # {trigger_phrase: reply_text}
 
 
-# --- 2. MADADGAAR FUNCTIONS aur SURAKSHA (Decorators) ---
+# --- 2. HELPER FUNCTIONS AND DECORATORS ---
 
-# Decorator jo check karta hai ki user BOSS hai ya nahi
-def sirf_boss_chalaye(kaam_func):
+# Decorator to check if the user is an admin
+def admin_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        if user_id not in BOSS_LOG:
+        if user_id not in ADMINS:
             await update.message.reply_text(
-                f"**Mazaak Mat Karo!** 😠 Aapke paas is command ki **power nahi** hai. Sirf **BOSS LOG** chala sakte hain.",
+                f"**Mazaak Mat Karo!** 😠 Aapke paas is command ki power **nahi** hai. Sirf **Admins** chala sakte hain.",
                 parse_mode='Markdown'
             )
             return
-        return await kaam_func(update, context)
+        return await func(update, context)
     return wrapper
 
-# Decorator jo check karta hai ki command group mein chal rahi hai
-def sirf_group_mein(kaam_func):
+# Decorator to check if the command is run in a group (for moderation commands)
+def group_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_chat.type not in ['group', 'supergroup']:
             await update.message.reply_text(
                 "Yeh command sirf **groups** mein chalti hai, akela kya karoge? 😉"
             )
             return
-        return await kaam_func(update, context)
+        return await func(update, context)
     return wrapper
 
 
-# --- 3. MUKHYA BOT HUKUM (Commands) ---
+# --- 3. CORE BOT COMMANDS (20+ COMMANDS) ---
 
-## 3.1. General aur Aam Hukumat
+## 3.1. General & Utility Commands
 
-async def shuru_karo_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Bot ka parichay."""
-    naam = update.effective_user.first_name
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Greets the user and introduces the bot."""
+    user = update.effective_user.first_name
     await update.message.reply_text(
-        f"**Namaste, {naam} Ji! 🙏** Main hoon aapka Code Ka Sardar. Hukumat karni hai toh /madad dekho!",
+        f"**Namaste, {user} Ji! 🙏** Main hoon aapka personal Code Moderator. Hukumat karni hai toh /help dekho!",
         parse_mode='Markdown'
     )
 
-async def madad_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Saare commands ki list."""
-    madad_paath = (
-        "**Aapki Sewa Mein Hazir!** ✨ (Hukumat ki List)\n\n"
-        "**Aam Hukumat**\n"
-        "🔸 /shuru_karo - Mera pehla parichay.\n"
-        "🔸 /madad - Sab commands ki list.\n"
-        "🔸 /haalchaal - Bot ka health check, sab **Theek Thak** hai?\n\n"
-        "**Boss Banna**\n"
-        "🔸 /raaz_shabd <chabhi> - Boss banna hai toh **sahi raaz** batao.\n"
-        "🔸 /mera_id - Aapki **pehchaan** (ID) kya hai?\n\n"
-        "**Rok-Tok aur Control (Sirf Boss Ke Liye)**\n"
-        "🔸 /dhakka_do - Kisi ko **bahar ka rasta** dikhao. (Reply to user)\n"
-        "🔸 /shaant_kar - Thodi der ke liye **Chup Kar!** (Reply to user)\n"
-        "🔸 /bolne_do - Azaadi! Mute hatake **bolne do**. (Reply to user)\n"
-        "🔸 /saaf_kar <count> - Pichli messages ka **safaya** karo.\n"
-        "🔸 /taang_do - Message ko **upar taang do**. (Reply to user)\n"
-        "🔸 /utaro - Upar se **utaro**.\n"
-        "🔸 /zor_se_bolo <text> - Zor se **chilla ke** bolo.\n"
-        "🔸 /boss_banao - Reply to a user to **make them Boss**.\n"
-        "🔸 /power_wapas - Reply to a Boss to **remove their Power**.\n"
-        "🔸 /nuke - **Poora chat uda do** (Only Maha Boss).\n\n"
-        "**Auto-Jawaab (Sirf Boss Ke Liye)**\n"
-        "🔸 /jawab_set_kar <trigger>|<reply> - Is **sawaal ka jawab** yeh hai.\n"
-        "🔸 /jawab_hata_do <trigger> - Woh **jawab bhool jao**.\n\n"
-        "**Masti aur Timepass**\n"
-        "🔸 /chutkula - **Hanso!** Ek ajeeb-o-gareeb joke suno.\n"
-        "🔸 /tana_mar - **Jalo!** Ek kadak roast suno.\n"
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lists all available commands with Indian-like descriptions."""
+    help_text = (
+        "**Aapki Sewa Mein Hazir!** ✨ (List of Commands)\n\n"
+        "**General Hukumat**\n"
+        "🔸 /start - Mera pehla parichay.\n"
+        "🔸 /help - Sab commands ki list (Yeh wali).\n"
+        "🔸 /status - Bot ka health check, sab **Theek Thak** hai?\n\n"
+        "**Access and Admin**\n"
+        "🔸 /password <passcode> - Admin banna hai toh **sahi raaz** batao.\n"
+        "🔸 /myid - Aapki **pehchaan** (ID) kya hai?\n\n"
+        "**Moderation & Control (Admins Only)**\n"
+        "🔸 /kick - Kisi ko **bahar ka rasta** dikhao. (Reply to user)\n"
+        "🔸 /mute <minutes> - Thodi der ke liye **Chup Kar!** (Reply to user)\n"
+        "🔸 /unmute - Azaadi! Mute hatake **bolne do**. (Reply to user)\n"
+        "🔸 /clear <count> - Pichli kuch messages ka **safaya** karo.\n"
+        "🔸 /pin - Message ko **upar taang do**. (Reply to user)\n"
+        "🔸 /unpin - Upar se **utaro**.\n"
+        "🔸 /shout <text> - Zor se **chilla ke** bolo.\n"
+        "🔸 /admin - Reply to a user to **make them Admin**.\n"
+        "🔸 /demote - Reply to an Admin to **remove their Admin power**.\n"
+        "🔸 /nuke - **Poora chat uda do** (Only Super Admin/Owner).\n\n"
+        "**Auto-Reply (Admins Only)**\n"
+        "🔸 /setautorelpy <trigger>|<reply> - Is **sawaal ka jawab** yeh hai.\n"
+        "🔸 /deleteautorelpy <trigger> - Woh **jawab bhool jao**.\n"
+        "🔸 /listauto - Saari **sikhaai hui baatein** dekho.\n\n"
+        "**Entertainment & Masti**\n"
+        "🔸 /joke - **Hanso!** Ek ajeeb-o-gareeb joke suno.\n"
+        "🔸 /roast - **Jalo!** Ek kadak roast suno.\n"
         "🔸 /bala - **Bala Bala!** Achanak ki masti.\n"
-        "🔸 /sikka_uchhalo - **Sikka uchhalo** (Heads or Tails).\n"
-        "🔸 /paasa_ghumao - **Pahada ghumao** (Random Number).\n"
+        "🔸 /gifsearch <query> - **Hilta-dulat picture** dhoondo.\n"
+        "🔸 /flipcoin - **Sikka uchhalo** (Heads or Tails).\n"
+        "🔸 /roll - **Pahada ghumao** (Random Number).\n\n"
+        "**Chat Tools**\n"
+        "🔸 /echo <text> - Jo bolo, wohi **waapas**.\n"
+        "🔸 /purge - **Saare messages udake** chat clean karo (Requires Reply).\n"
     )
-    await update.message.reply_text(madad_paath, parse_mode='Markdown')
+    await update.message.reply_text(help_text, parse_mode='Markdown')
 
-async def mera_id_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User ki ID dikhata hai."""
+async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows the user's ID."""
     user_id = update.effective_user.id
     await update.message.reply_text(f"**Aapki Pehchaan (ID):** `{user_id}`", parse_mode='Markdown')
 
-async def haalchaal_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Bot ka health check."""
-    boss_count = len(BOSS_LOG)
-    rules_count = len(AUTO_JAWAAB_NIZAM)
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Checks the bot's health."""
+    admins_count = len(ADMINS)
+    rules_count = len(AUTOREPLY_RULES)
     await update.message.reply_text(
         f"**Theek Thak Hai!** Bot bilkul chaka-chak chal raha hai. 😎\n"
-        f"➡️ **Boss Log:** {boss_count} log\n"
-        f"➡️ **Auto-Jawaab Nizam:** {rules_count} sikhaye hain."
+        f"➡️ **Admins:** {admins_count} log\n"
+        f"➡️ **Auto-Reply Rules:** {rules_count} sikhaye hain."
     )
 
-async def sikka_uchhalo_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sikka uchhalta hai."""
+async def gifsearch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Search for a GIF using the Google tool."""
+    query = ' '.join(context.args)
+    if not query:
+        await update.message.reply_text("Kya dhoondhna hai, **bolo toh sahi**!")
+        return
+    
+    # You would typically use a dedicated GIF API (like Giphy/Tenor) here.
+    # For simplicity, we'll suggest a Google search for a GIF.
+    await update.message.reply_text(
+        f"**GIF Dhoondh Raha Hoon...** Aap Google par search kar sakte hain:\n"
+        f"`{query} gif`",
+        parse_mode='Markdown'
+    )
+
+async def flipcoin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Flips a coin."""
     import random
-    nateeja = random.choice(["Heads (Chit)", "Tails (Pat)"])
-    await update.message.reply_text(f"**Sikka Uchhala!** Aur aaya... **{nateeja}**! 🪙")
+    result = random.choice(["Heads (Chit)", "Tails (Pat)"])
+    await update.message.reply_text(f"**Sikka Uchhala!** Aur aaya... **{result}**! 🪙")
 
-async def paasa_ghumao_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Random number (paasa) ghumata hai."""
+async def roll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Rolls a random number."""
     import random
-    ankh = random.randint(1, 100)
-    await update.message.reply_text(f"**Pahada Ghumaya!** Number aaya... **{ankh}**! 🎲")
+    number = random.randint(1, 100)
+    await update.message.reply_text(f"**Pahada Ghumaya!** Number aaya... **{number}**! 🎲")
+    
+async def echo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Echoes the user's text."""
+    text = ' '.join(context.args)
+    if text:
+        await update.message.reply_text(f"Aapne Bola: {text}")
+    else:
+        await update.message.reply_text("**Khaali** echo karke kya faayda? Kuch likho na!")
 
 
-## 3.2. Authentication aur Boss Commands
+## 3.2. Authentication & Admin Commands
 
-async def raaz_shabd_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Password se admin banata hai."""
-    if len(context.args) == 1 and context.args[0] == RAAZ_SHABD:
+async def password_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allows user to become an admin with a password."""
+    if len(context.args) == 1 and context.args[0] == PASSCODE:
         user_id = update.effective_user.id
-        if user_id not in BOSS_LOG:
-            BOSS_LOG.add(user_id)
+        if user_id not in ADMINS:
+            ADMINS.add(user_id)
             await update.message.reply_text(
-                "**Balle Balle!** 🎉 Aap ab **Boss Log** ki fauj mein shamil ho gaye hain. Nayi power Mubarak!"
+                "**Balle Balle!** 🎉 Aap ab **Admins** ki fauj mein shamil ho gaye hain. Nayi power Mubarak!"
             )
         else:
-            await update.message.reply_text("Aap toh pehle se hi Boss hain, Sir.")
+            await update.message.reply_text(
+                "**Mazaak Mat Karo!** Aap toh pehle se hi Admin hain, Sir."
+            )
     else:
-        await update.message.reply_text("Password **Galat** hai, Dost. **Dur Raho!** 🤨")
+        await update.message.reply_text(
+            "**Galat Raaz** bataya, Dost. Sahi password laao, warna **Dur Raho!** 🤨"
+        )
 
-@sirf_boss_chalaye
-async def boss_banao_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reply kiye gaye user ko Boss banata hai."""
+@admin_only
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Makes a replied-to user an admin."""
     if update.message.reply_to_message:
         target_user = update.message.reply_to_message.from_user
-        BOSS_LOG.add(target_user.id)
+        ADMINS.add(target_user.id)
         await update.message.reply_text(
-            f"**Aapka Hukum Sir!** ✅ User **{target_user.first_name}** ko **Boss** bana diya gaya hai."
+            f"**Aapka Hukum Sir!** ✅ User **{target_user.first_name}** ko **Admin** bana diya gaya hai. Ab inhe bhi power mil gayi."
         )
     else:
-        await update.message.reply_text("Boss banane ke liye kisi ke **message ko reply** karo.")
+        await update.message.reply_text("Admin banane ke liye kisi ke **message ko reply** karo.")
 
-@sirf_boss_chalaye
-async def power_wapas_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reply kiye gaye user se Boss power wapas leta hai."""
+@admin_only
+async def demote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Removes admin status from a replied-to user."""
     if update.message.reply_to_message:
         target_user = update.message.reply_to_message.from_user
-        if target_user.id in BOSS_LOG:
-            if target_user.id == MAHA_BOSS_ID:
-                await update.message.reply_text("**Arrey!** Maha Boss ki power wapas nahi le sakte. Unki power **Amar** hai.")
+        if target_user.id in ADMINS:
+            if target_user.id == SUPER_ADMIN_ID:
+                await update.message.reply_text("**Arrey!** Super Admin ko demote nahi kar sakte. Unki power **Amar** hai.")
                 return
 
-            BOSS_LOG.discard(target_user.id)
+            ADMINS.discard(target_user.id)
             await update.message.reply_text(
-                f"**Power Chheen Li!** ❌ User **{target_user.first_name}** ko **Aam Aadmi** bana diya gaya hai. Ab aaram karo."
+                f"**Power Chheen Li!** ❌ User **{target_user.first_name}** ko **Demote** kar diya gaya hai. Ab aaram karo."
             )
         else:
-            await update.message.reply_text("Yeh toh pehle se hi **Aam Aadmi** hain.")
+            await update.message.reply_text("Yeh toh pehle se hi **aam aadmi** hain, Admin the hi nahi.")
     else:
-        await update.message.reply_text("Power wapas lene ke liye kisi Boss ke **message ko reply** karo.")
+        await update.message.reply_text("Demote karne ke liye kisi Admin ke **message ko reply** karo.")
 
+## 3.3. Moderation Commands
 
-## 3.3. Rok-Tok aur Control
-
-@sirf_boss_chalaye
-@sirf_group_mein
-async def dhakka_do_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User ko group se bahar nikalta hai (Kick)."""
+@admin_only
+@group_only
+async def kick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kicks a replied-to user from the group."""
     if update.message.reply_to_message:
         target_user_id = update.message.reply_to_message.from_user.id
         target_user_name = update.message.reply_to_message.from_user.first_name
 
         try:
             await context.bot.ban_chat_member(chat_id=update.effective_chat.id, user_id=target_user_id)
-            await context.bot.unban_chat_member(chat_id=update.effective_chat.id, user_id=target_user_id) # Standard 'kick'
+            # Unban immediately so they can rejoin (standard 'kick' behavior)
+            await context.bot.unban_chat_member(chat_id=update.effective_chat.id, user_id=target_user_id)
             await update.message.reply_text(
-                f"**TADAA!** 👋 User **{target_user_name}** ko **dhakka** de diya gaya hai."
+                f"**TADAA!** 👋 User **{target_user_name}** ko **bahar ka rasta** dikha diya gaya hai. Abhi aao, ya kal aana."
             )
         except error.TelegramBadRequest:
-            await update.message.reply_text("Mai isko **Kick** nahi kar sakta. Power nahi hai ya yeh Boss hai.")
+            await update.message.reply_text("Mai isko **Kick** nahi kar sakta. Shayad mere paas **power nahi** hai ya yeh Admin hai.")
     else:
         await update.message.reply_text("Kick karne ke liye kisi ke **message ko reply** karo, Sir.")
 
-@sirf_boss_chalaye
-@sirf_group_mein
-async def shaant_kar_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User ko shaant (Mute) karta hai."""
+@admin_only
+@group_only
+async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mutes a replied-to user for a specified duration."""
     if not update.message.reply_to_message:
-        await update.message.reply_text("Mute karne ke liye **message ko reply** karo aur time (minutes) batao. Example: `/shaant_kar 10`.")
+        await update.message.reply_text("Mute karne ke liye kisi ke **message ko reply** karo aur time (minutes) batao. Example: `/mute 10`.")
         return
 
     try:
-        samay_minutes = int(context.args[0])
+        duration_minutes = int(context.args[0])
     except (IndexError, ValueError):
-        await update.message.reply_text("Samay (minutes) toh batao! Example: `/shaant_kar 10`.")
+        await update.message.reply_text("Time (minutes) toh batao! Example: `/mute 10`.")
         return
 
     target_user_id = update.message.reply_to_message.from_user.id
     target_user_name = update.message.reply_to_message.from_user.first_name
     
+    # Calculate mute time
     import datetime
-    shaanti_end_time = datetime.datetime.now() + datetime.timedelta(minutes=samay_minutes)
+    mute_until = datetime.datetime.now() + datetime.timedelta(minutes=duration_minutes)
 
     try:
+        # Restrict permissions: can't send messages, polls, media, etc.
         await context.bot.restrict_chat_member(
             chat_id=update.effective_chat.id,
             user_id=target_user_id,
-            permissions=ChatPermissions(can_send_messages=False),
-            until_date=shaanti_end_time
+            permissions=telegram.ChatPermissions(can_send_messages=False),
+            until_date=mute_until
         )
-        SHAANT_KIE_GAYE_LOG[target_user_id] = shaanti_end_time.timestamp()
+        MUTED_USERS[target_user_id] = mute_until.timestamp()
         await update.message.reply_text(
-            f"**CHUP KAR!** 🤫 User **{target_user_name}** ko **{samay_minutes}** minute ke liye **Shaant** kar diya gaya hai."
+            f"**CHUP KAR!** 🤫 User **{target_user_name}** ko **{duration_minutes}** minute ke liye **Mute** kar diya gaya hai. Aaram karo ab."
         )
     except error.TelegramBadRequest:
-        await update.message.reply_text("Mai isko **Shaant** nahi kar sakta. Power nahi.")
+        await update.message.reply_text("Mai isko **Mute** nahi kar sakta. Shayad yeh Admin hai ya mere paas permission nahi.")
 
-@sirf_boss_chalaye
-@sirf_group_mein
-async def bolne_do_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User ko bolne deta hai (Unmute)."""
+@admin_only
+@group_only
+async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Unmutes a replied-to user."""
     if not update.message.reply_to_message:
-        await update.message.reply_text("Unmute karne ke liye **message ko reply** karo.")
+        await update.message.reply_text("Unmute karne ke liye kisi ke **message ko reply** karo.")
         return
 
     target_user_id = update.message.reply_to_message.from_user.id
     target_user_name = update.message.reply_to_message.from_user.first_name
 
     try:
-        # Default permissions de rahe hain
+        # Restore default permissions (can send messages, media, etc.)
         await context.bot.restrict_chat_member(
             chat_id=update.effective_chat.id,
             user_id=target_user_id,
-            permissions=ChatPermissions(
-                can_send_messages=True, can_send_media_messages=True, can_send_polls=True,
-                can_send_other_messages=True, can_add_web_page_previews=True, can_invite_users=True,
+            permissions=telegram.ChatPermissions(
+                can_send_messages=True,
+                can_send_media_messages=True,
+                can_send_polls=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+                can_change_info=False, # Standard for non-admins
+                can_invite_users=True,
+                can_pin_messages=False, # Standard for non-admins
             ),
         )
-        if target_user_id in SHAANT_KIE_GAYE_LOG:
-            del SHAANT_KIE_GAYE_LOG[target_user_id]
+        if target_user_id in MUTED_USERS:
+            del MUTED_USERS[target_user_id]
         await update.message.reply_text(
-            f"**Azaadi!** 📢 User **{target_user_name}** ab **Bol Sakta** hai."
+            f"**Azaadi!** 📢 User **{target_user_name}** ab **Unmute** ho gaya hai. Ab bol sakte ho, lekin **Shanti** se."
         )
     except error.TelegramBadRequest:
-        await update.message.reply_text("Unmute mein gadbad. Shayad woh pehle se hi Unmute the.")
+        await update.message.reply_text("Unmute mein gadbad. Shayad woh pehle se hi Unmute the ya mere paas permission nahi.")
 
-@sirf_boss_chalaye
-@sirf_group_mein
-async def taang_do_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reply kiye gaye message ko pin karta hai."""
+@admin_only
+@group_only
+async def pin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pins a replied-to message."""
     if update.message.reply_to_message:
         try:
             await context.bot.pin_chat_message(
                 chat_id=update.effective_chat.id,
                 message_id=update.message.reply_to_message.message_id,
-                disable_notification=True 
+                disable_notification=True # Optional: no sound notification
             )
             await update.message.reply_text("**Upar Taang Diya!** 📌 Yeh message ab sabse upar rahega.")
         except error.TelegramBadRequest:
-            await update.message.reply_text("Pin karne mein gadbad. Mere paas **Pin** ki power nahi hai.")
+            await update.message.reply_text("Pin karne mein gadbad. Mere paas **Pin** ki power nahi hai kya?")
     else:
         await update.message.reply_text("Pin karne ke liye **message ko reply** karo.")
 
-@sirf_boss_chalaye
-@sirf_group_mein
-async def utaro_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Saare pinned messages ko unpin karta hai."""
+@admin_only
+@group_only
+async def unpin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Unpins the last pinned message."""
     try:
         await context.bot.unpin_all_chat_messages(chat_id=update.effective_chat.id)
         await update.message.reply_text("**Upar Se Utaar Diya!** 🗑️ Saare pinned messages hat gaye.")
     except error.TelegramBadRequest:
         await update.message.reply_text("Unpin karne mein gadbad. Koi message **Pin** tha hi nahi kya?")
 
-@sirf_boss_chalaye
-@sirf_group_mein
-async def saaf_kar_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Specify kiye gaye messages ko delete karta hai."""
+@admin_only
+@group_only
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deletes a specified number of messages."""
     try:
-        kitna_ginti = int(context.args[0])
+        count = int(context.args[0])
     except (IndexError, ValueError):
-        await update.message.reply_text("Kitne messages udane hain? Number batao. Example: `/saaf_kar 5`")
+        await update.message.reply_text("Kitne messages udane hain? Number batao. Example: `/clear 5`")
         return
 
-    # Deletion logic (same as the English version, iterating over IDs)
+    # Telegram API does not allow bulk deletion of non-service messages.
+    # We must iterate and delete one by one.
+    # NOTE: Messages older than 48 hours in a Supergroup cannot be deleted by a bot.
+
     message_ids_to_delete = []
-    current_id = update.message.message_id
-    
-    # If replied, delete from that message to the current one
+    # Fetch messages up to the 'count' limit, including the command message itself
+    # NOTE: Fetching previous messages reliably is complex without a database.
+    # The following is a simplified, non-guaranteed approach by getting the IDs around the command.
+    # The reliable way is for the user to reply to the first message they want to delete.
+
+    # Simpler approach: If replied to, delete from that message to the current one.
     if update.message.reply_to_message:
         start_id = update.message.reply_to_message.message_id
-        message_ids_to_delete = list(range(start_id, current_id + 1))
+        end_id = update.message.message_id
+        # Creates a list of IDs to try and delete
+        message_ids_to_delete = list(range(start_id, end_id + 1))
     else:
-        # Simple fallback for the last 'kitna_ginti' messages
-        message_ids_to_delete = list(range(current_id - kitna_ginti + 1, current_id + 1))
+        # Fallback: Just try to delete the last 'count' messages by ID.
+        # This is very unreliable in a busy chat but attempts to fulfil the command.
+        current_id = update.message.message_id
+        message_ids_to_delete = list(range(current_id - count + 1, current_id + 1))
 
     deleted_count = 0
     await update.message.reply_text(f"**Safaya Shuru...** 🧹 {len(message_ids_to_delete)} messages udane ki koshish...")
+    
+    # Deleting the messages
+    for msg_id in reversed(message_ids_to_delete):
+        try:
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg_id)
+            deleted_count += 1
+        except error.TelegramError:
+            # Silently skip if deletion fails (e.g., message too old, or already deleted)
+            pass
+
+    # A final status message is often needed, but deleting it can confuse the user.
+    # The previous message is a placeholder.
+
+@admin_only
+@group_only
+async def nuke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deletes all messages in the chat (Super Admin only - highly dangerous)."""
+    # This is a very complex operation and usually requires a dedicated cleanup sequence
+    # and confirmation, as bots cannot delete all messages older than 48 hours.
+
+    if update.effective_user.id != SUPER_ADMIN_ID:
+        await update.message.reply_text("**Ruko!** 🛑 Yeh toh **Super Admin** ki power hai. **Khatra** hai ismein!")
+        return
+    
+    await update.message.reply_text(
+        "**DANGER!** ⚠️ **NUKE** chalane se pehle **sach mein soch lo**.\n"
+        "Agar **pukka** karna hai toh **`/nuke confirm`** likho.\n"
+        "(Note: Bot sirf 48 ghante se naye messages hi uda sakta hai.)"
+    )
+
+    if len(context.args) == 1 and context.args[0].lower() == 'confirm':
+        await update.message.reply_text("**Aapka Hukum Sir!** 💣 NUKE shuru... Sab kuch **SAFAYA**!")
+        
+        # A real 'nuke' would involve fetching the message history (which is difficult
+        # without external storage) and iterating to delete, as the 'clear' command.
+
+        # For the template, we just send the confirmation message.
+        await update.bot.send_message(
+             chat_id=update.effective_chat.id,
+             text="**(Simulation of deletion complete)**. Baaki sab **Super Admin** ki zimmedari. 😎"
+        )
+    
+@admin_only
+async def shout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends a message to the chat with bold text."""
+    text_to_shout = ' '.join(context.args)
+    if not text_to_shout:
+        await update.message.reply_text("Kya **chillana** hai, likho toh sahi!")
+        return
+    
+    # Try to delete the command message for a cleaner shout
+    try:
+        await update.message.delete()
+    except error.TelegramError:
+        pass # Ignore if deletion fails
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=f"**📢 CHILLAO! KYA HUKUM HAI?**\n\n**➡️ {text_to_shout.upper()}**",
+        parse_mode='Markdown'
+    )
+
+## 3.4. Auto-Reply Commands
+
+@admin_only
+async def setautorelpy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sets a new auto-reply rule: /setautorelpy <trigger>|<reply>"""
+    try:
+        if len(context.args) < 1:
+            raise ValueError
+        
+        full_command = ' '.join(context.args)
+        if '|' not in full_command:
+            await update.message.reply_text("Format galat hai, Sir! Aise likho: `/setautorelpy sawaal|jawab`")
+            return
+
+        trigger, reply = full_command.split('|', 1)
+        trigger = trigger.strip().lower()
+        reply = reply.strip()
+
+        if not trigger or not reply:
+            await update.message.reply_text("Sawaal aur Jawab, **dono zaroori** hain!")
+            return
+
+        AUTOREPLY_RULES[trigger] = reply
+        await update.message.reply_text(
+            f"**Seekh Liya!** ✅ Jab koi **`{trigger}`** bolega, toh main **`{reply}`** bolunga.",
+            parse_mode='Markdown'
+        )
+    except Exception:
+        await update.message.reply_text("Format mein gadbad. Example: `/setautorelpy hello|namaste`")
+
+@admin_only
+async def deleteautorelpy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deletes an auto-reply rule: /deleteautorelpy <trigger>"""
+    trigger = ' '.join(context.args).strip().lower()
+
+    if not trigger:
+        await update.message.reply_text("Kaunsa rule **bhulana** hai? **Trigger** batao.")
+        return
+
+    if trigger in AUTOREPLY_RULES:
+        reply_text = AUTOREPLY_RULES.pop(trigger)
+        await update.message.reply_text(
+            f"**Bhula Diya!** 🧠 Rule **`{trigger}`** (Jawab: `{reply_text[:20]}...`) ko **delete** kar diya gaya hai.",
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text(f"Rule **`{trigger}`** toh **sikhaya** hi nahi tha.")
+
+@admin_only
+async def listauto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lists all active auto-reply rules."""
+    if not AUTOREPLY_RULES:
+        await update.message.reply_text("**Khaali Panna!** Koi Auto-Reply rule sikhaya nahi gaya.")
+        return
+
+    rules_list = "**Saari Sikhaai Hui Baatein:** 📜\n\n"
+    for trigger, reply in AUTOREPLY_RULES.items():
+        rules_list += f"👉 **Trigger:** `{trigger}`\n   **Jawab:** `{reply[:50]}...`\n---\n"
+    
+    await update.message.reply_text(rules_list, parse_mode='Markdown')
+
+async def handle_auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles incoming messages and checks for auto-reply triggers."""
+    if update.message and update.message.text:
+        text = update.message.text.strip().lower()
+        
+        # Simple exact match for auto-reply
+        if text in AUTOREPLY_RULES:
+            reply_text = AUTOREPLY_RULES[text]
+            await update.message.reply_text(reply_text)
+            return
+
+        # Simple check for muted user (though telegram handles the restriction via API)
+        if update.effective_user.id in MUTED_USERS:
+            # Check if mute time is over (Simple in-memory check)
+            import time
+            if time.time() < MUTED_USERS[update.effective_user.id]:
+                 # Try to delete the message of the muted user
+                try:
+                    await update.message.delete()
+                    # Optional: Send a private notification to the user or a warning in the chat
+                except error.TelegramError:
+                    pass # Cannot delete
+
+## 3.5. Entertainment Commands
+
+async def fetch_random_data(api_url: str) -> str:
+    """Helper to fetch data from an external API."""
+    try:
+        response = requests.get(api_url, timeout=5)
+        response.raise_for_status() # Raise exception for bad status codes
+        return response.json()
+    except requests.exceptions.RequestException:
+        return None
+
+async def joke_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fetches a random joke."""
+    await update.message.reply_text("**Ruko...** Achha joke dhoondh raha hoon. 🧐")
+    
+    # Using the official Joke API (English Jokes)
+    joke_data = await fetch_random_data("https://v2.jokeapi.dev/joke/Any?blacklistFlags=nsfw,religious,political,racist,sexist,explicit&type=single")
+    
+    if joke_data and joke_data.get('joke'):
+        joke = joke_data['joke']
+        await update.message.reply_text(f"**HA HA HA!** 😂\n\n{joke}\n\n**(Maza Aaya?)**")
+    else:
+        await update.message.reply_text("Arey yaar! Koi **dhanka joke** nahi mila. Server so raha hai. 😴")
+
+async def roast_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fetches a random roast (Slightly modified joke/insult API)."""
+    await update.message.reply_text("**Tez Mirchi** la raha hoon. Koi **jalega** ab. 🔥")
+
+    # Using the 'insult' API from the 'evilinsult.com' as a 'roast' source (English)
+    roast_data = await fetch_random_data("https://evilinsult.com/generate_insult.php?lang=en&type=json")
+
+    if roast_data and roast_data.get('insult'):
+        roast = roast_data['insult']
+        await update.message.reply_text(f"**SUNO! KADAK BAAT!** 🌶️\n\n{roast}\n\n**(Jalaa kya?)**")
+    else:
+        await update.message.reply_text("Server busy hai. Aaj **roast** nahi, bas **pyaar** milega. 🥰")
+
+async def bala_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A fun, random command."""
+    await update.message.reply_text(
+        "**BALA! BALA! SHAITAN KA SAALA!** 🕺💃\n\n(Achanak ki masti zaroori hai!)"
+    )
+
+## 3.6. Purge Command (Advanced Clear)
+
+@admin_only
+@group_only
+async def purge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deletes all messages from a replied-to message up to the current command."""
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Purge karne ke liye **pehle message ko reply** karo jahan se safaya shuru karna hai.")
+        return
+
+    start_id = update.message.reply_to_message.message_id
+    end_id = update.message.message_id
+    
+    # +1 to include the command message itself
+    message_ids_to_delete = list(range(start_id, end_id + 1)) 
+    
+    deleted_count = 0
+    await update.message.reply_text(f"**Mahasafaya Shuru...** 🌪️ **{len(message_ids_to_delete)}** messages udane ki koshish...")
     
     for msg_id in reversed(message_ids_to_delete):
         try:
@@ -314,204 +573,62 @@ async def saaf_kar_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except error.TelegramError:
             pass 
 
-@sirf_boss_chalaye
-@sirf_group_mein
-async def nuke_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Chat ko nuke karta hai (Sirf Maha Boss)."""
-    if update.effective_user.id != MAHA_BOSS_ID:
-        await update.message.reply_text("**Ruko!** 🛑 Yeh toh **Maha Boss** ki power hai. **Khatra** hai ismein!")
-        return
-    
-    await update.message.reply_text(
-        "**DANGER!** ⚠️ **NUKE** chalane se pehle **sach mein soch lo**.\n"
-        "Agar **pukka** karna hai toh **`/nuke pakka`** likho."
-    )
+# --- 4. MAIN FUNCTION AND POLLING ---
 
-    if len(context.args) == 1 and context.args[0].lower() == 'pakka':
-        await update.message.reply_text("**Aapka Hukum Sir!** 💣 NUKE shuru... Sab kuch **SAFAYA**!")
-        
-        # Actual deletion logic would go here (similar to saaf_kar, but over a larger range)
-        await update.bot.send_message(
-             chat_id=update.effective_chat.id,
-             text="**(Safaya complete)**. Chat ab **clean** hai. 😎"
-        )
-    
-@sirf_boss_chalaye
-async def zor_se_bolo_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Message ko bold karke shout karta hai."""
-    chillane_ka_paath = ' '.join(context.args)
-    if not chillane_ka_paath:
-        await update.message.reply_text("Kya **chillana** hai, likho toh sahi!")
-        return
-    
-    try:
-        await update.message.delete()
-    except error.TelegramError:
-        pass 
-
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=f"**📢 CHILLAO! KYA HUKUM HAI?**\n\n**➡️ {chillane_ka_paath.upper()}**",
-        parse_mode='Markdown'
-    )
-
-## 3.4. Auto-Jawaab Commands
-
-@sirf_boss_chalaye
-async def jawab_set_kar_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Naya auto-reply rule set karta hai."""
-    try:
-        full_command = ' '.join(context.args)
-        if '|' not in full_command:
-            await update.message.reply_text("Format galat hai! Aise likho: `/jawab_set_kar sawaal|jawab`")
-            return
-
-        trigger, reply = full_command.split('|', 1)
-        sawaal = trigger.strip().lower()
-        jawab = reply.strip()
-
-        if not sawaal or not jawab:
-            await update.message.reply_text("Sawaal aur Jawab, **dono zaroori** hain!")
-            return
-
-        AUTO_JAWAAB_NIZAM[sawaal] = jawab
-        await update.message.reply_text(
-            f"**Seekh Liya!** ✅ Jab koi **`{sawaal}`** bolega, toh main **`{jawab}`** bolunga.",
-            parse_mode='Markdown'
-        )
-    except Exception:
-        await update.message.reply_text("Format mein gadbad. Example: `/jawab_set_kar hello|namaste`")
-
-@sirf_boss_chalaye
-async def jawab_hata_do_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Auto-reply rule ko delete karta hai."""
-    sawaal = ' '.join(context.args).strip().lower()
-
-    if not sawaal:
-        await update.message.reply_text("Kaunsa rule **bhulana** hai? **Sawaal** batao.")
-        return
-
-    if sawaal in AUTO_JAWAAB_NIZAM:
-        reply_text = AUTO_JAWAAB_NIZAM.pop(sawaal)
-        await update.message.reply_text(
-            f"**Bhula Diya!** 🧠 Rule **`{sawaal}`** ko **delete** kar diya gaya hai.",
-            parse_mode='Markdown'
-        )
-    else:
-        await update.message.reply_text(f"Rule **`{sawaal}`** toh **sikhaya** hi nahi tha.")
-
-async def handle_auto_jawab(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Aane waale messages ko check karta hai auto-reply ke liye."""
-    if update.message and update.message.text:
-        paath = update.message.text.strip().lower()
-        
-        # Check for Mute status (Optional check, Telegram should handle it)
-        if update.effective_user.id in SHAANT_KIE_GAYE_LOG:
-            import time
-            if time.time() < SHAANT_KIE_GAYE_LOG[update.effective_user.id]:
-                try:
-                    await update.message.delete()
-                except error.TelegramError:
-                    pass
-                return
-        
-        # Auto-Jawaab check
-        if paath in AUTO_JAWAAB_NIZAM:
-            jawab_paath = AUTO_JAWAAB_NIZAM[paath]
-            await update.message.reply_text(jawab_paath)
-            return
-
-## 3.5. Masti Commands
-
-async def fetch_random_data(api_url: str) -> dict | None:
-    """External API se data fetch karta hai."""
-    try:
-        response = requests.get(api_url, timeout=5)
-        response.raise_for_status() 
-        return response.json()
-    except requests.exceptions.RequestException:
-        return None
-
-async def chutkula_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Random chutkula (Joke) lata hai."""
-    await update.message.reply_text("**Ruko...** Achha chutkula dhoondh raha hoon. 🧐")
-    
-    chutkula_data = await fetch_random_data("https://v2.jokeapi.dev/joke/Any?blacklistFlags=nsfw,religious,political,racist,sexist,explicit&type=single")
-    
-    if chutkula_data and chutkula_data.get('joke'):
-        chutkula = chutkula_data['joke']
-        await update.message.reply_text(f"**HA HA HA!** 😂\n\n{chutkula}\n\n**(Maza Aaya?)**")
-    else:
-        await update.message.reply_text("Arey yaar! Koi **dhanka chutkula** nahi mila. Server so raha hai. 😴")
-
-async def tana_mar_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Random tana (Roast) lata hai."""
-    await update.message.reply_text("**Tez Mirchi** la raha hoon. Koi **jalega** ab. 🔥")
-
-    tana_data = await fetch_random_data("https://evilinsult.com/generate_insult.php?lang=en&type=json")
-
-    if tana_data and tana_data.get('insult'):
-        tana = tana_data['insult']
-        await update.message.reply_text(f"**SUNO! KADAK TANA!** 🌶️\n\n{tana}\n\n**(Jalaa kya?)**")
-    else:
-        await update.message.reply_text("Server busy hai. Aaj **tana** nahi, bas **pyaar** milega. 🥰")
-
-async def bala_hukum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Bala! Bala! command."""
-    await update.message.reply_text(
-        "**BALA! BALA! SHAITAN KA SAALA!** 🕺💃\n\n(Achanak ki masti zaroori hai!)"
-    )
-
-# --- 4. MUKHYA FUNCTION aur BOT CHALANA ---
-
-def mukhya_kaam():
-    """Bot ko shuru karta hai."""
+def main():
+    """Starts the bot."""
     print("🚀 Bot shuru ho raha hai... (Starting the bot process)")
     
-    application = ApplicationBuilder().token(BOT_CHABHI).build()
+    # Ensure you have imported from telegram.ext import ApplicationBuilder
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
     
-    # Handlers jodna (Command Handlers)
+    # 1. General Commands
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("myid", myid_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("echo", echo_command))
+    application.add_handler(CommandHandler("gifsearch", gifsearch_command))
+    application.add_handler(CommandHandler("flipcoin", flipcoin_command))
+    application.add_handler(CommandHandler("roll", roll_command))
+
+    # 2. Authentication & Admin Commands
+    application.add_handler(CommandHandler("password", password_command))
+    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("demote", demote_command))
+
+    # 3. Moderation Commands
+    application.add_handler(CommandHandler("kick", kick_command))
+    application.add_handler(CommandHandler("mute", mute_command))
+    application.add_handler(CommandHandler("unmute", unmute_command))
+    application.add_handler(CommandHandler("pin", pin_command))
+    application.add_handler(CommandHandler("unpin", unpin_command))
+    application.add_handler(CommandHandler("clear", clear_command))
+    application.add_handler(CommandHandler("nuke", nuke_command))
+    application.add_handler(CommandHandler("shout", shout_command))
+    application.add_handler(CommandHandler("purge", purge_command))
+
+    # 4. Auto-Reply Commands
+    application.add_handler(CommandHandler("setautorelpy", setautorelpy_command))
+    application.add_handler(CommandHandler("deleteautorelpy", deleteautorelpy_command))
+    application.add_handler(CommandHandler("listauto", listauto_command))
     
-    # General Commands
-    application.add_handler(CommandHandler("start", shuru_karo_hukum))
-    application.add_handler(CommandHandler("madad", madad_hukum))
-    application.add_handler(CommandHandler("mera_id", mera_id_hukum))
-    application.add_handler(CommandHandler("haalchaal", haalchaal_hukum))
-    application.add_handler(CommandHandler("sikka_uchhalo", sikka_uchhalo_hukum))
-    application.add_handler(CommandHandler("paasa_ghumao", paasa_ghumao_hukum))
-    
-    # Boss Commands
-    application.add_handler(CommandHandler("raaz_shabd", raaz_shabd_hukum))
-    application.add_handler(CommandHandler("boss_banao", boss_banao_hukum))
-    application.add_handler(CommandHandler("power_wapas", power_wapas_hukum))
+    # 5. Entertainment Commands
+    application.add_handler(CommandHandler("joke", joke_search_command))
+    application.add_handler(CommandHandler("roast", roast_search_command))
+    application.add_handler(CommandHandler("bala", bala_command))
 
-    # Moderation Commands
-    application.add_handler(CommandHandler("dhakka_do", dhakka_do_hukum))
-    application.add_handler(CommandHandler("shaant_kar", shaant_kar_hukum))
-    application.add_handler(CommandHandler("bolne_do", bolne_do_hukum))
-    application.add_handler(CommandHandler("taang_do", taang_do_hukum))
-    application.add_handler(CommandHandler("utaro", utaro_hukum))
-    application.add_handler(CommandHandler("saaf_kar", saaf_kar_hukum))
-    application.add_handler(CommandHandler("nuke", nuke_hukum))
-    application.add_handler(CommandHandler("zor_se_bolo", zor_se_bolo_hukum))
+    # 6. Message Handler for Auto-Reply
+    # Must be added after all command handlers
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_auto_reply))
 
-    # Auto-Reply Commands
-    application.add_handler(CommandHandler("jawab_set_kar", jawab_set_kar_hukum))
-    application.add_handler(CommandHandler("jawab_hata_do", jawab_hata_do_hukum))
-    
-    # Masti Commands
-    application.add_handler(CommandHandler("chutkula", chutkula_hukum))
-    application.add_handler(CommandHandler("tana_mar", tana_mar_hukum))
-    application.add_handler(CommandHandler("bala", bala_hukum))
-
-    # Message Handler for Auto-Reply
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_auto_jawab))
-
-    # Bot ko chalana (Keep Alive)
-    print("✅ Bot chalne laga hai. (Press Ctrl+C to stop)")
+    # Start the Bot - This loop handles the "keep alive"
+    print("✅ Bot chalne laga hai. (Bot running - press Ctrl+C to stop)")
     application.run_polling(poll_interval=3)
 
 if __name__ == '__main__':
-    mukhya_kaam()
+    # Add this line to avoid a 'name 'telegram' is not defined' error when using telegram.ChatPermissions
+    import telegram 
+    main()
 
-# --- END OF FILE (DE-SI CODE) ---
+# --- END OF FILE ---
