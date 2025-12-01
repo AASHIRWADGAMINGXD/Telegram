@@ -1,243 +1,235 @@
+import telebot
 import os
 import json
-import logging
-import asyncio
 import random
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-from dotenv import load_dotenv
+import time
+from telebot import types
 from keep_alive import keep_alive
+from dotenv import load_dotenv
 
-# --- CONFIGURATION ---
+# Load Environment Variables
 load_dotenv()
-TOKEN = os.getenv('TOKEN')
+TOKEN = os.getenv('BOT_TOKEN')
+BOT_PASSWORD = os.getenv('BOT_PASSWORD')
 
-# Logging
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
+bot = telebot.TeleBot(TOKEN)
 
-# Files
-DATA_FILE = 'data.json'
-JOKES_FILE = 'jokes.json'
-ROASTS_FILE = 'roasts.json'
+# --- DATABASE FOR AUTO-REPLY (JSON) ---
+try:
+    with open('autoreply.json', 'r') as f:
+        auto_replies = json.load(f)
+except:
+    auto_replies = {}
 
-# --- GANGSTER DICTIONARY ---
-ABUSE_WORDS = ["kutta", "kamina", "bc", "mc", "bhosdike", "chutiya", "stupid", "idiot", "saale"]
-GANGSTER_REPLIES = [
-    "Abey dhakkan! Kisko gaali diya?",
-    "Zuban sambhal ke baat kar, varna jabda tod dunga.",
-    "Ae! Khopdi tod saale ka.",
-    "Baap ko mat sikha, chal nikal.",
-    "Jyada shana mat ban, apun ke ilake me hai tu."
+# --- LISTS FOR FUN ---
+jokes = [
+    "Teacher: Pappu, batao hospital mein sabse mehnga bed kaunsa hota hai?\nPappu: Death bed sir, uspar letne ke liye jaan deni padti hai! 😂",
+    "Girl: Mere pet mein chuhe daud rahe hain.\nBoy: To muh khol, billi daal deta hoon! 🤣",
+    "Santa: Oye, tu school kyu nahi gaya?\nBanta: Yaar, kal school walo ne weight check kiya tha, aaj height check karenge. Main darr gaya ki kahi saale lund na naap de! 💀"
 ]
 
+roasts = [
+    "Shakal dekh ke lagta hai aadha download hua hai tu.",
+    "Bhai tu rehne de, tujhse na ho payega.",
+    "Jitna dimaag tere paas hai, utna to main chutta chhod deta hoon.",
+    "Teri shakal dekh ke WiFi bhi disconnect ho jata hai."
+]
+
+# Authorized Users (Who entered password)
+authorized_users = []
+
 # --- HELPER FUNCTIONS ---
-def load_json(filename):
+def save_replies():
+    with open('autoreply.json', 'w') as f:
+        json.dump(auto_replies, f)
+
+def is_admin(message):
     try:
-        with open(filename, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return [] if filename != DATA_FILE else {}
+        chat_member = bot.get_chat_member(message.chat.id, message.from_user.id)
+        return chat_member.status in ['administrator', 'creator'] or message.from_user.id in authorized_users
+    except:
+        return False
 
-def save_json(filename, data):
-    with open(filename, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
-
-# --- COMMANDS ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Aur Bhai! Kya bolti public? Apun aa gaya hai. 😎\n\n"
-        "Commands dekh le chhote:\n"
-        "🎬 /bala - Nacho bc\n"
-        "🔇 /mute - Muh band karwa de\n"
-        "🦵 /kick - Laat maar ke nikaal\n"
-        "😂 /joke - Ek mast joke sun\n"
-        "🔥 /roast - Izzat ka falooda kar\n"
-        "📢 /shout - Chilllaaaa\n"
-        "💣 /nuke - Sab khatam (Admin Only)\n"
-        "⚙️ /setautoreply - System set kar\n"
-        "🗑 /deleteautoreply - System hata"
-    )
-
-async def bala(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gif_url = "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExbm90eG50eG50eG50eG50eG50eG50eG50eG50eG50/l3vRlT2k2L35Cnn5C/giphy.gif"
-    await context.bot.send_animation(chat_id=update.effective_chat.id, animation=gif_url, caption="Bala... Bala... Shaitan ka saala!")
-
-async def joke(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    jokes = load_json(JOKES_FILE)
-    if not jokes:
-        await update.message.reply_text("Jokes khatam ho gaye bidu! Admin ko bol naya maal laye.")
-        return
-    await update.message.reply_text(f"😂 **Sun be:**\n\n{random.choice(jokes)}", parse_mode='Markdown')
-
-async def roast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    roasts = load_json(ROASTS_FILE)
-    if not roasts:
-        await update.message.reply_text("Abhi mood nahi hai beizzat karne ka.")
-        return
-    
-    target = update.effective_user.first_name
-    if update.message.reply_to_message:
-        target = update.message.reply_to_message.from_user.first_name
+# --- PASSWORD SYSTEM ---
+@bot.message_handler(commands=['login'])
+def login_system(message):
+    try:
+        msg_text = message.text.split()
+        if len(msg_text) < 2:
+            bot.reply_to(message, "Arey password to daal bhai! Usage: `/login <password>`")
+            return
         
-    await update.message.reply_text(f"🔥 **Oye {target}!**\n{random.choice(roasts)}", parse_mode='Markdown')
+        password = msg_text[1]
+        if password == BOT_PASSWORD:
+            if message.from_user.id not in authorized_users:
+                authorized_users.append(message.from_user.id)
+                bot.reply_to(message, "Badhai ho Bhai! Access mil gaya. Ab tu Don hai. 😎")
+            else:
+                bot.reply_to(message, "Tu pehle se hi login hai chomu.")
+        else:
+            bot.reply_to(message, "Galat password! Nikal yahan se. 😡")
+    except Exception as e:
+        bot.reply_to(message, f"Error aa gaya bhai: {e}")
 
-async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Hawa mein mute karu kya? Reply kar uske message pe.")
+# --- MODERATION COMMANDS ---
+
+@bot.message_handler(commands=['kick'])
+def kick_user(message):
+    if not is_admin(message):
+        bot.reply_to(message, "Chal be, tu Admin nahi hai!")
         return
-    
-    user = update.message.reply_to_message.from_user
+    if not message.reply_to_message:
+        bot.reply_to(message, "Kis ko udana hai? Reply to kar uske message pe.")
+        return
     try:
-        await context.bot.restrict_chat_member(
-            chat_id=update.effective_chat.id,
-            user_id=user.id,
-            permissions={"can_send_messages": False}
-        )
-        await update.message.reply_text(f"🤫 Oye {user.first_name}! Muh band rakh abhi. Mute kar diya tereko.")
-    except Exception:
-        await update.message.reply_text("Apun ke paas power nahi hai (Make me Admin).")
+        bot.kick_chat_member(message.chat.id, message.reply_to_message.from_user.id)
+        bot.reply_to(message, f"Uda diya saale ko! {message.reply_to_message.from_user.first_name} gaya tel lene. ✈️")
+    except Exception as e:
+        bot.reply_to(message, "Power kam pad gayi bhai (Permission Error).")
 
-async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Kisko laat marna hai? Reply kar pehle.")
+@bot.message_handler(commands=['mute'])
+def mute_user(message):
+    if not is_admin(message):
+        bot.reply_to(message, "Tu Admin nahi hai, shant baith.")
         return
-
-    user = update.message.reply_to_message.from_user
+    if not message.reply_to_message:
+        bot.reply_to(message, "Kiska muh band karna hai? Reply kar.")
+        return
     try:
-        await context.bot.ban_chat_member(update.effective_chat.id, user.id)
-        await context.bot.unban_chat_member(update.effective_chat.id, user.id) 
-        await update.message.reply_text(f"🦵 Nikal lawde! {user.first_name} gaya tel lene.")
-    except Exception:
-        await update.message.reply_text("Admin bana na be pehle apun ko.")
+        bot.restrict_chat_member(message.chat.id, message.reply_to_message.from_user.id, until_date=time.time()+300) # Mute for 5 mins
+        bot.reply_to(message, "Chup karja thodi der! (Muted for 5 mins) 🤐")
+    except:
+        bot.reply_to(message, "Admin rights check karle bhai.")
 
-async def afk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await update.message.reply_text(f"😴 {user.first_name} bhai abhi gayab hai. Disturb na karne ka.")
-
-async def shout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Kya chillaun be? Likh ke de aage.")
+@bot.message_handler(commands=['clear', 'purge'])
+def clear_messages(message):
+    if not is_admin(message):
+        bot.reply_to(message, "Tere bas ki baat nahi hai.")
         return
-    
-    text = " ".join(context.args).upper()
-    shouted_text = " 📢 ".join(list(text))
-    await update.message.reply_text(f"📢 {shouted_text} 📢")
+    try:
+        args = message.text.split()
+        amount = int(args[1]) if len(args) > 1 else 10
+        
+        # Limit to avoid API errors
+        if amount > 100: amount = 100
+        
+        message_ids = [message.message_id - i for i in range(amount + 1)]
+        for mid in message_ids:
+            try:
+                bot.delete_message(message.chat.id, mid)
+            except:
+                pass
+        bot.send_message(message.chat.id, f"Safai Abhiyan Complete! {amount} messages uda diye. 🧹")
+    except:
+        bot.reply_to(message, "Usage: `/clear 10`")
 
-# --- NUKE COMMAND ---
-async def nuke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    chat_member = await context.bot.get_chat_member(update.effective_chat.id, user_id)
-    if chat_member.status not in ['administrator', 'creator']:
-        await update.message.reply_text("Tera aukat nahi hai ye button dabane ka.")
+@bot.message_handler(commands=['promote'])
+def promote_user(message):
+    if not is_admin(message): return
+    if not message.reply_to_message: return
+    try:
+        bot.promote_chat_member(message.chat.id, message.reply_to_message.from_user.id, can_change_info=True, can_delete_messages=True, can_invite_users=True, can_restrict_members=True, can_pin_messages=True)
+        bot.reply_to(message, "Mubarak ho! Naya Admin bana diya isko. 👮‍♂️")
+    except:
+        bot.reply_to(message, "Main isko promote nahi kar sakta bhai.")
+
+# --- UTILITY COMMANDS ---
+
+@bot.message_handler(commands=['pin'])
+def pin_message(message):
+    if not is_admin(message): return
+    if not message.reply_to_message:
+        bot.reply_to(message, "Reply to kar jisko Pin karna hai.")
         return
+    bot.pin_chat_message(message.chat.id, message.reply_to_message.message_id)
+    bot.reply_to(message, "Thok diya pin! 📌")
 
-    keyboard = [
-        [InlineKeyboardButton("Ha uda de (YES)", callback_data='nuke_yes')],
-        [InlineKeyboardButton("Nahi Bhai Rehne de (NO)", callback_data='nuke_no')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("⚠ *WARNING* ⚠\n50 Message uda du kya seedha? Pakka?", reply_markup=reply_markup, parse_mode='Markdown')
+@bot.message_handler(commands=['unpin'])
+def unpin_message(message):
+    if not is_admin(message): return
+    bot.unpin_chat_message(message.chat.id)
+    bot.reply_to(message, "Pin hata diya bhai.")
 
-async def nuke_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == 'nuke_yes':
-        await query.edit_message_text(text="💣 BOMB GIROOO! Safayi chalu...")
-        message_id = query.message.message_id
-        count = 0
-        try:
-            for i in range(50):
-                try:
-                    # Trying to delete previous messages
-                    await context.bot.delete_message(chat_id=query.message.chat_id, message_id=message_id - i)
-                    count += 1
-                    await asyncio.sleep(0.1) # Small delay to prevent flood limits
-                except Exception:
-                    continue # Skip if message doesn't exist or too old
-            
-            msg = await context.bot.send_message(chat_id=query.message.chat_id, text=f"💥 Dhamaka ho gaya! {count} kachra saaf.")
-            await asyncio.sleep(5)
-            await msg.delete()
-            
-        except Exception as e:
-            await context.bot.send_message(chat_id=query.message.chat_id, text="Kuch lafda ho gaya delete karne me.")
-            
+@bot.message_handler(commands=['shout'])
+def shout_msg(message):
+    text = message.text.replace("/shout", "").upper()
+    if text:
+        bot.send_message(message.chat.id, f"📢 **{text}** 📢", parse_mode="Markdown")
     else:
-        await query.edit_message_text(text="Thik hai, maaf kiya aaj.")
+        bot.reply_to(message, "Kya chillaun? Kuch likh to sahi.")
 
-# --- JSON AUTO REPLY COMMANDS ---
-async def set_autoreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = " ".join(context.args)
-    if "|" not in text:
-        await update.message.reply_text("Format galat hai bidu. Aise likh: \n`/setautoreply hello | Aur bhai kaisa hai`", parse_mode='Markdown')
+@bot.message_handler(commands=['nuke'])
+def nuke_chat(message):
+    if not is_admin(message):
+        bot.reply_to(message, "Ye button dabane ki aukaat nahi hai teri.")
         return
-
-    trigger, response = text.split("|", 1)
-    trigger = trigger.strip().lower()
-    response = response.strip()
-
-    data = load_json(DATA_FILE)
-    data[trigger] = response
-    save_json(DATA_FILE, data)
-
-    await update.message.reply_text(f"Set kar diya! Jab koi bolega '{trigger}', apun bolega '{response}'.")
-
-async def delete_autoreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    trigger = " ".join(context.args).strip().lower()
-    data = load_json(DATA_FILE)
     
-    if trigger in data:
-        del data[trigger]
-        save_json(DATA_FILE, data)
-        await update.message.reply_text(f"Hata diya '{trigger}' ko list se.")
-    else:
-        await update.message.reply_text("Ye to list me hai hi nahi be.")
+    bot.reply_to(message, "☢️ ATOMIC BOMB DETECTED... 3... 2... 1... BOOM! (Just kidding, deleting 50 messages)")
+    # Reuse clear logic
+    try:
+        message_ids = [message.message_id - i for i in range(51)]
+        for mid in message_ids:
+            try:
+                bot.delete_message(message.chat.id, mid)
+            except: pass
+    except: pass
 
-# --- MAIN MESSAGE HANDLER ---
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
+# --- AUTO REPLY SYSTEM ---
 
-    text_lower = update.message.text.lower()
+@bot.message_handler(commands=['setreply'])
+def set_auto_reply(message):
+    if not is_admin(message): return
+    try:
+        # Syntax: /setreply word | response
+        content = message.text.replace("/setreply", "").strip()
+        if "|" in content:
+            trigger, response = content.split("|", 1)
+            auto_replies[trigger.strip().lower()] = response.strip()
+            save_replies()
+            bot.reply_to(message, f"Set kar diya boss! Jab koi bolega '{trigger.strip()}', main bolunga '{response.strip()}'.")
+        else:
+            bot.reply_to(message, "Sahi se likh bhai: `/setreply Hello | Namaste`")
+    except Exception as e:
+        bot.reply_to(message, "Error aa gaya.")
 
-    # 1. Abuse Check
-    if any(word in text_lower for word in ABUSE_WORDS):
-        await update.message.reply_text(random.choice(GANGSTER_REPLIES))
-        return 
+@bot.message_handler(commands=['delreply'])
+def del_auto_reply(message):
+    if not is_admin(message): return
+    try:
+        word = message.text.replace("/delreply", "").strip().lower()
+        if word in auto_replies:
+            del auto_replies[word]
+            save_replies()
+            bot.reply_to(message, f"Hata diya '{word}' ko memory se.")
+        else:
+            bot.reply_to(message, "Ye to list mein hai hi nahi.")
+    except: pass
 
-    # 2. Auto Reply Check
-    data = load_json(DATA_FILE)
-    if text_lower in data:
-        await update.message.reply_text(data[text_lower])
+# --- FUN COMMANDS ---
 
-# --- APP RUN ---
-if __name__ == '__main__':
-    keep_alive()
-    
-    print("Bot chalu ho raha hai...")
-    
-    # Init Application
-    application = Application.builder().token(TOKEN).build()
+@bot.message_handler(commands=['bala'])
+def bala_command(message):
+    bot.send_message(message.chat.id, "🕺 Shaitaan ka Saala... Bala Bala! 🕺\n(Imagine music playing)")
 
-    # Handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("bala", bala))
-    application.add_handler(CommandHandler("mute", mute))
-    application.add_handler(CommandHandler("kick", kick))
-    application.add_handler(CommandHandler("afk", afk))
-    application.add_handler(CommandHandler("shout", shout))
-    application.add_handler(CommandHandler("joke", joke))
-    application.add_handler(CommandHandler("roast", roast))
-    application.add_handler(CommandHandler("nuke", nuke_command))
-    application.add_handler(CommandHandler("setautoreply", set_autoreply))
-    application.add_handler(CommandHandler("deleteautoreply", delete_autoreply))
-    
-    application.add_handler(CallbackQueryHandler(nuke_confirm))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+@bot.message_handler(commands=['joke'])
+def send_joke(message):
+    bot.reply_to(message, random.choice(jokes))
 
-    # Fix for Conflict Error: Drop pending updates on restart
-    print("Cleaning old connections...")
-    application.run_polling(drop_pending_updates=True)
+@bot.message_handler(commands=['roast'])
+def send_roast(message):
+    target = message.reply_to_message.from_user.first_name if message.reply_to_message else message.from_user.first_name
+    roast_line = random.choice(roasts)
+    bot.send_message(message.chat.id, f"Oye {target}! {roast_line} 🔥")
+
+# --- LISTENER FOR AUTO-REPLIES & MESSAGES ---
+@bot.message_handler(func=lambda message: True)
+def handle_messages(message):
+    # Check for auto-replies
+    msg_text = message.text.lower()
+    if msg_text in auto_replies:
+        bot.reply_to(message, auto_replies[msg_text])
+
+# --- START BOT ---
+print("Bot Start ho gaya hai bhai log...")
+keep_alive() # Starts the web server
+bot.infinity_polling()
