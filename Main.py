@@ -112,6 +112,15 @@ async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def shout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = " ".join(context.args).upper()
+    
+    # --- BAD WORD CHECK (MODIFIED) ---
+    # Convert to lowercase for case-insensitive check
+    lower_msg = " ".join(context.args).lower() 
+    
+    if "levi ki" in lower_msg or "levi ka" in lower_msg:
+        return await update.message.reply_text("⛔ **Aisi baatein nahi chilani!** Sahi tarah se message likh.")
+    # --- END BAD WORD CHECK ---
+    
     if not msg:
         return await update.message.reply_text("Kya chilana hai? Likh to sahi!")
     await update.message.reply_text(f"📢 **{msg}**", parse_mode='Markdown')
@@ -136,7 +145,7 @@ async def nuke_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == 'nuke_no':
-        await query.edit_message_text("👍 **Bach gaye!** Nuke cancel kar diya.")
+        await query.edit_message_text("👍 **Bach गए!** Nuke cancel kar diya.")
     
     elif query.data == 'nuke_yes':
         await query.edit_message_text("☢️ **Nuke Incoming...** Messages ud rahe hain.")
