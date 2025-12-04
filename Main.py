@@ -1,7 +1,7 @@
 import os
 import logging
 import html
-import re  # Import Regex for advanced filtering
+import re  # Regex for advanced text cleaning
 from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, constants
 from telegram.ext import (
     ApplicationBuilder, 
@@ -30,11 +30,12 @@ warns = {}
 afk_users = {}
 auto_replies = {}
 
-# --- BAD WORDS LIST (Common Hinglish Abuses) ---
+# --- BAD WORDS LIST (Abuse Filter) ---
 BAD_WORDS = {
     "madarchod", "bhenchod", "bsdk", "gand", "gaand", "chutiya", "choot", 
     "lodu", "lawde", "lund", "bhosdike", "randi", "randwa", "mc", "bc", 
-    "mkc", "bkc", "behenchod", "kuttiya", "harami", "kamine", "chod"
+    "mkc", "bkc", "behenchod", "kuttiya", "harami", "kamine", "chod",
+    "saala", "kamina", "bhadwa"
 }
 
 # --- HELPER: AUTH CHECK ---
@@ -55,14 +56,21 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (
-        "🙏 **Namaste Bhai!** System update ho gaya hai.\n\n"
-        "**Features:**\n"
-        "👮 Abuse Filter (Gaali doge to sunoge)\n"
-        "🎲 7 Number Magic\n"
-        "☢️ `/nuke` - Chat clear\n"
-        "📢 `/shout` - Announcement\n"
-        "⚠️ `/warn` - User Warning\n"
-        "🤖 Auto-Replies & More..."
+        "🙏 Namaste Bhai! System update ho gaya hai.”
+
+Available Commands:
+👮 /warn - Warning de bande ko
+☢️ /nuke - Chat clear (Confirmation ke saath)
+📢 /shout [msg] - Zor se bol
+⬆️ /promote & ⬇️ /demote - Power control
+🐢 /setslowmode [seconds] - Chat speed control
+💤 /afk [reason] - Offline chala ja
+📌 /pin & /unpin - Message chipkao
+🎲 /roll - Ludo khel le
+🕺 /bala - Party shuru!
+🤖 /setautoreply [word] | [reply] - Auto jawab
+❌ /deleteautoreply [word] - Auto jawab delete
+🔑 /login [pass] - Secret access
     )
     await update.message.reply_text(txt, parse_mode='Markdown')
 
@@ -97,7 +105,7 @@ async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.ban_chat_member(chat_id, target.id)
             warns[target.id] = 0
-            msg = f"🚫 **Khatam!** {target.first_name} banned due to 3 warnings."
+            msg = f"🚫 **Khatam!** {target.first_name} ko uda diya (3 Warnings)."
         except:
             msg += "\n(Ban failed, Admin power check kar)"
 
@@ -119,7 +127,7 @@ async def nuke_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == 'nuke_yes':
-        await query.edit_message_text("☢️ **Nuke Started...**")
+        await query.edit_message_text("☢️ **Uda Raha Hu...**")
         chat_id = query.message.chat_id
         msg_id = query.message.message_id
         try:
@@ -131,7 +139,7 @@ async def nuke_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await query.edit_message_text("👍 **Cancelled.**")
 
-# --- ADMIN TOOLS (Promote/Demote/Pin etc) ---
+# --- ADMIN TOOLS ---
 async def promote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context): return
     if update.message.reply_to_message:
@@ -198,29 +206,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text_raw = update.message.text
     text_lower = text_raw.lower()
     
-    # 1. SPECIAL TRIGGER: "tere upar bala" logic
-    # Clean text: Remove ALL spaces and ALL dots to handle "T.u p.i le" or "7 ."
-    clean_text = re.sub(r'[\s\.]', '', text_lower) # Removes spaces and dots only
+    # 1. SPECIAL TRIGGER: "Tere Upar Bala" Logic
+    # We create a version of text without spaces or dots
+    # This turns "s.e.v.e.n" -> "seven" and "tu . pi . le" -> "tupile"
+    clean_text = re.sub(r'[\s\.]', '', text_lower) 
     
-    # Logic A: If text contains "7" (Raw check allowed for simple 7)
-    # Checks if '7' is present anywhere, even if "7." or " 7 "
+    triggered_bala = False
+    
+    # Condition A: Number "7" anywhere in raw text (e.g. "7", "7.", "17")
     if "7" in text_raw:
+        triggered_bala = True
+        
+    # Condition B: Word "seven" in clean text (e.g. "seven", "s.e.v.e.n", "s ev en")
+    elif "seven" in clean_text:
+        triggered_bala = True
+        
+    # Condition C: Specific Phrase "tupilepermeramut" in clean text
+    elif "tupilepermeramut" in clean_text:
+        triggered_bala = True
+    
+    if triggered_bala:
         await update.message.reply_text("Tere upar Bala")
-        return # Stop processing other checks if triggered
+        return # Priority: Stop further processing (like abuse check)
 
-    # Logic B: "Tu pi le per mera mut" check
-    # We check the cleaned text so "Tu. pi le" becomes "tupile"
-    target_phrase = "tupilepermeramut"
-    
-    if target_phrase in clean_text:
-        await update.message.reply_text("Tere upar Bala")
-        return # Stop processing
-    
-    # 2. ABUSE FILTER (Check for bad words)
-    # Split text to check individual words against bad list
-    words_in_msg = set(text_lower.split())
-    # Also check if any bad word is a substring (for joined words)
+    # 2. ABUSE FILTER
     found_bad = False
+    # Check strict words first (to avoid partial matches misfiring if needed, but here we do broad check)
     for bad in BAD_WORDS:
         if bad in text_lower:
             found_bad = True
@@ -228,11 +239,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     if found_bad:
         await update.message.reply_text(f"⛔ **Oye {user.first_name}!** Gaali mat de, tameez se reh.")
-        # Optional: Delete message (Uncomment below line if bot is Admin)
         # try: await update.message.delete()
         # except: pass
 
-    # 3. AFK Check
+    # 3. AFK Handler
     if user.id in afk_users:
         del afk_users[user.id]
         await update.message.reply_text(f"👋 **Welcome Back {user.first_name}!**")
@@ -240,7 +250,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.reply_to_message:
         replied_id = update.message.reply_to_message.from_user.id
         if replied_id in afk_users:
-            await update.message.reply_text(f"🤫 **User AFK hai.** Reason: {afk_users[replied_id]}")
+            await update.message.reply_text(f"🤫 **Wo AFK hai.** Reason: {afk_users[replied_id]}")
 
     # 4. Auto Reply
     if text_lower in auto_replies:
@@ -274,5 +284,5 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(nuke_callback))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
-    print("🚀 Bot Started with Bala Logic...")
+    print("🚀 Bot Started with Updated '7/Seven' Logic...")
     app.run_polling()
