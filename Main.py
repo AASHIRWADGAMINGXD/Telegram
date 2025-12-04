@@ -58,19 +58,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (
         "🙏 Namaste Bhai! System update ho gaya hai.”
 
-Available Commands:
-👮 /warn - Warning de bande ko
-☢️ /nuke - Chat clear (Confirmation ke saath)
-📢 /shout [msg] - Zor se bol
-⬆️ /promote & ⬇️ /demote - Power control
-🐢 /setslowmode [seconds] - Chat speed control
-💤 /afk [reason] - Offline chala ja
-📌 /pin & /unpin - Message chipkao
-🎲 /roll - Ludo khel le
-🕺 /bala - Party shuru!
-🤖 /setautoreply [word] | [reply] - Auto jawab
-❌ /deleteautoreply [word] - Auto jawab delete
-🔑 /login [pass] - Secret access
+"Available Commands:"
+"👮 /warn - Warning de bande ko \n"
+"☢️ /nuke - Chat clear (Confirmation ke saath) \n"
+"📢 /shout [msg] - Zor se bol \n"
+"⬆️ /promote & ⬇️ /demote - Power control \n"
+"🐢 /setslowmode [seconds] - Chat speed control \n"
+"💤 /afk [reason] - Offline chala ja \n"
+"📌 pin & /unpin - Message chipkao \n"
+"🎲 /roll - Ludo khel le \n"
+"🕺 /bala - Party shuru! \n"
+"🤖 /setautoreply [word] | [reply] - Auto jawab \n"
+"❌ /deleteautoreply [word] - Auto jawab delete \n"
+"🔑 /login [pass] - Secret access \n"
     )
     await update.message.reply_text(txt, parse_mode='Markdown')
 
