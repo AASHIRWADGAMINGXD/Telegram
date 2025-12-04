@@ -33,7 +33,7 @@ auto_replies = {}
 ABUSE_LIST = [
     "bsdk", "bhosdike", "mc", "madarchod", "bc", "bhenchod", "chutiya", 
     "gandu", "lavde", "lawde", "laude", "kutta", "kamina", "harami", 
-    "fuck", "dick", "pussy", "bitch", "randi", "saale", "suar"
+    "Tu pi le per Mera mut", "Tu .pi le. per Mera mut", "Tu pi le per Mera mut..", "bitch", "randi", "saale", "suar"
 ]
 
 # --- HELPER: AUTH CHECK ---
