@@ -55,22 +55,22 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 # --- CORE FEATURES ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # FIXED: Corrected the quotes and string formatting here
     txt = (
-        "🙏 Namaste Bhai! System update ho gaya hai. \n”
-
-"Available Commands:"
-"👮 /warn - Warning de bande ko \n"
-"☢️ /nuke - Chat clear (Confirmation ke saath) \n"
-"📢 /shout [msg] - Zor se bol \n"
-"⬆️ /promote & ⬇️ /demote - Power control \n"
-"🐢 /setslowmode [seconds] - Chat speed control \n"
-"💤 /afk [reason] - Offline chala ja \n"
-"📌 pin & /unpin - Message chipkao \n"
-"🎲 /roll - Ludo khel le \n"
-"🕺 /bala - Party shuru! \n"
-"🤖 /setautoreply [word] | [reply] - Auto jawab \n"
-"❌ /deleteautoreply [word] - Auto jawab delete \n"
-"🔑 /login [pass] - Secret access \n"
+        "🙏 **Namaste Bhai!** System update ho gaya hai.\n\n"
+        "**Available Commands:**\n"
+        "👮 `/warn` - Warning de bande ko\n"
+        "☢️ `/nuke` - Chat clear (Confirmation ke saath)\n"
+        "📢 `/shout [msg]` - Zor se bol\n"
+        "⬆️ `/promote` & ⬇️ `/demote` - Power control\n"
+        "🐢 `/setslowmode [seconds]` - Chat speed control\n"
+        "💤 `/afk [reason]` - Offline chala ja\n"
+        "📌 `/pin` & `/unpin` - Message chipkao\n"
+        "🎲 `/roll` - Ludo khel le\n"
+        "🕺 `/bala` - Party shuru!\n"
+        "🤖 `/setautoreply [word] | [reply]` - Auto jawab\n"
+        "❌ `/deleteautoreply [word]` - Auto jawab delete\n"
+        "🔑 `/login [pass]` - Secret access"
     )
     await update.message.reply_text(txt, parse_mode='Markdown')
 
