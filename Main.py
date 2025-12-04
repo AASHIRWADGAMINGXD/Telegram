@@ -56,7 +56,7 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (
-        "🙏 Namaste Bhai! System update ho gaya hai.”
+        "🙏 Namaste Bhai! System update ho gaya hai. \n”
 
 "Available Commands:"
 "👮 /warn - Warning de bande ko \n"
