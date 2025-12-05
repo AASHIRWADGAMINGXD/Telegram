@@ -33,7 +33,7 @@ auto_replies = {}
 # --- BAD WORDS LIST (Abuse Filter) ---
 BAD_WORDS = {
     "madarchod", "bhenchod", "bsdk", "gand", "gaand", "chutiya", "choot", 
-    "lodu", "lawde", "lund", "bhosdike", "randi", "randwa", "mc", "bc", 
+    "lodu", "lawde", "lund", "bhosdike", "Aashirwad ki", "Levi ki", "mc", "bc", 
     "mkc", "bkc", "behenchod", "kuttiya", "harami", "kamine", "chod",
     "saala", "kamina", "bhadwa"
 }
