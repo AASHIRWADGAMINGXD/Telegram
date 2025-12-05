@@ -33,9 +33,7 @@ auto_replies = {}
 # --- FORBIDDEN WORDS LISTS ---
 # General abuse filter for chat
 BAD_WORDS = {
-    "madarchod", "bhenchod", "bsdk", "gand", "gaand", "chutiya", "choot", 
-    "lodu", "lawde", "lund", "bhosdike", "mc", "bc", "mkc", "bkc", 
-    "behenchod", "kuttiya", "harami", "kamine", "chod", "saala", "kamina", "bhadwa"
+  
 }
 
 # Specific phrases the Bot will REFUSE to shout
@@ -44,6 +42,10 @@ FORBIDDEN_SHOUTS = [
     "aashirwad ki", 
     "shabd preet ki", 
     "anant ki"
+     "Levi ki", 
+    "Aashirwad ki", 
+    "Shabd ki", 
+    "Anant ki"
 ]
 
 # --- HELPER: AUTH CHECK ---
@@ -326,6 +328,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text_raw = update.message.text
     text_lower = text_raw.lower()
+    
+    # Check if message contains a Link (http, https, www)
+    # If it contains a link, we DISABLE the Bala trigger to avoid false alarms
+    is_link = re.search(r'(http|https|www\.)', text_lower)
     
     # 1. SPECIAL TRIGGER: "Tere Upar Bala" Logic (Bot command removed, but trigger kept)
     clean_text = re.sub(r'[\s\.]', '', text_lower) 
