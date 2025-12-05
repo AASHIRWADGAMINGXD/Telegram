@@ -332,23 +332,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if message contains a Link (http, https, www)
     # If it contains a link, we DISABLE the Bala trigger to avoid false alarms
     is_link = re.search(r'(http|https|www\.)', text_lower)
-    
-    if not is_link:
-    # 1. SPECIAL TRIGGER: "Tere Upar Bala" Logic (Bot command removed, but trigger kept)
-    clean_text = re.sub(r'[\s\.]', '', text_lower) 
-    
+
+    # 1. SPECIAL TRIGGER: "Tere Upar Bala"
     triggered_bala = False
-    if "7" in text_raw:
-        triggered_bala = True
-    elif "seven" in clean_text:
-        triggered_bala = True
-    elif "tupilepermeramut" in clean_text:
-        triggered_bala = True
+    
+    # We only check for 7/Seven if there is NO link in the message
+    if not is_link:
+        clean_text = re.sub(r'[\s\.]', '', text_lower)
+        
+        if "7" in text_raw:
+            triggered_bala = True
+        elif "seven" in clean_text:
+            triggered_bala = True
+        elif "tupilepermeramut" in clean_text:
+            triggered_bala = True
     
     if triggered_bala:
         await update.message.reply_text("Tere upar Bala")
-        return # Stop processing abuse check for this fun trigger
-
+        return # Stop processing (bypass abuse filter)
     # 2. ABUSE FILTER
     found_bad = False
     for bad in BAD_WORDS:
