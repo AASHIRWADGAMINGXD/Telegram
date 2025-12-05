@@ -1,8 +1,8 @@
 import os
 import logging
-import html
-import re  # Regex for advanced text cleaning
-from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, constants
+import re
+import asyncio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, 
     ContextTypes, 
@@ -30,44 +30,54 @@ warns = {}
 afk_users = {}
 auto_replies = {}
 
-# --- BAD WORDS LIST (Abuse Filter) ---
+# --- FORBIDDEN WORDS LISTS ---
+# General abuse filter for chat
 BAD_WORDS = {
     "madarchod", "bhenchod", "bsdk", "gand", "gaand", "chutiya", "choot", 
-    "lodu", "lawde", "lund", "bhosdike", "Aashirwad ki", "Levi ki", "mc", "bc", 
-    "mkc", "bkc", "behenchod", "kuttiya", "harami", "kamine", "chod",
-    "saala", "kamina", "bhadwa"
+    "lodu", "lawde", "lund", "bhosdike", "mc", "bc", "mkc", "bkc", 
+    "behenchod", "kuttiya", "harami", "kamine", "chod", "saala", "kamina", "bhadwa"
 }
+
+# Specific phrases the Bot will REFUSE to shout
+FORBIDDEN_SHOUTS = [
+    "levi ki", 
+    "aashirwad ki", 
+    "shabd preet ki", 
+    "anant ki"
+]
 
 # --- HELPER: AUTH CHECK ---
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
+    
+    # Check if logged in via password
     if user_id in authorized_users:
         return True
+    
+    # Check actual Telegram Admin status
     try:
         member = await context.bot.get_chat_member(chat_id, user_id)
         if member.status in ['administrator', 'creator']:
             return True
-    except:
-        pass
+    except Exception as e:
+        logger.error(f"Admin check error: {e}")
     return False
 
-# --- CORE FEATURES ---
+# --- CORE COMMANDS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # FIXED: Corrected the quotes and string formatting here
     txt = (
-        "🙏 **Namaste Bhai!** System update ho gaya hai.\n\n"
+        "🙏 **Namaste Bhai!** System Update v2.0 Live.\n\n"
         "**Available Commands:**\n"
-        "👮 `/warn` - Warning de bande ko\n"
-        "☢️ `/nuke` - Chat clear (Confirmation ke saath)\n"
-        "📢 `/shout [msg]` - Zor se bol\n"
-        "⬆️ `/promote` & ⬇️ `/demote` - Power control\n"
-        "🐢 `/setslowmode [seconds]` - Chat speed control\n"
+        "👮 `/warn` - Warning de (Reply to user)\n"
+        "☢️ `/nuke` - **NEW:** Panel se message delete kar\n"
+        "📢 `/shout [msg]` - Zor se bol (Mods Only)\n"
+        "⬆️ `/promote` & ⬇️ `/demote` - Power control (Fixed)\n"
+        "🐢 `/setslowmode [seconds]` - Chat speed (0, 10, 30...)\n"
         "💤 `/afk [reason]` - Offline chala ja\n"
         "📌 `/pin` & `/unpin` - Message chipkao\n"
         "🎲 `/roll` - Ludo khel le\n"
-        "🕺 `/bala` - Party shuru!\n"
         "🤖 `/setautoreply [word] | [reply]` - Auto jawab\n"
         "❌ `/deleteautoreply [word]` - Auto jawab delete\n"
         "🔑 `/login [pass]` - Secret access"
@@ -106,71 +116,185 @@ async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.ban_chat_member(chat_id, target.id)
             warns[target.id] = 0
             msg = f"🚫 **Khatam!** {target.first_name} ko uda diya (3 Warnings)."
-        except:
-            msg += "\n(Ban failed, Admin power check kar)"
+        except Exception as e:
+            msg += f"\n(Ban failed: {e})"
 
     await update.message.reply_text(msg)
 
 async def shout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = " ".join(context.args).upper()
+    # 1. MODERATOR ONLY CHECK
+    if not await is_admin(update, context):
+        return await update.message.reply_text("⛔ Sirf Admins shout kar sakte hain!")
+
+    msg = " ".join(context.args)
     if not msg:
         return await update.message.reply_text("Likhna kya hai?")
-    await update.message.reply_text(f"📢 **{msg}**", parse_mode='Markdown')
 
-# --- NUKE SYSTEM ---
-async def nuke_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context): return
-    keyboard = [[InlineKeyboardButton("✅ Haan", callback_data='nuke_yes'), InlineKeyboardButton("❌ Nahi", callback_data='nuke_no')]]
-    await update.message.reply_text("💣 **Chat Clear Karein?**", reply_markup=InlineKeyboardMarkup(keyboard))
+    # 2. CENSORSHIP CHECK
+    msg_lower = msg.lower()
+    for forbidden in FORBIDDEN_SHOUTS:
+        if forbidden in msg_lower:
+            return await update.message.reply_text("❌ **Ye shabd allowed nahi hain!**")
+
+    await update.message.reply_text(f"📢 **{msg.upper()}**", parse_mode='Markdown')
+
+# --- NUKE SYSTEM (NEW PANEL) ---
+
+async def nuke_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context): 
+        return await update.message.reply_text("⛔ Power nahi hai.")
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("🗑️ Clean 10", callback_data='clean_10'),
+            InlineKeyboardButton("🗑️ Clean 30", callback_data='clean_30')
+        ],
+        [
+            InlineKeyboardButton("☢️ Clean 50", callback_data='clean_50'),
+            InlineKeyboardButton("🔥 Clean 100", callback_data='clean_100')
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data='nuke_cancel')]
+    ]
+    await update.message.reply_text("🧹 **Cleaning Panel**\nKitne message udane hain?", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def nuke_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    if query.data == 'nuke_yes':
-        await query.edit_message_text("☢️ **Uda Raha Hu...**")
-        chat_id = query.message.chat_id
-        msg_id = query.message.message_id
-        try:
-            for i in range(1, 50):
-                try: await context.bot.delete_message(chat_id, msg_id - i)
-                except: pass
-            await context.bot.send_message(chat_id, "💥 **Chat Cleaned!**")
-        except: pass
-    else:
-        await query.edit_message_text("👍 **Cancelled.**")
+    if not await is_admin(update, context):
+        return await query.answer("⛔ Admin only!", show_alert=True)
 
-# --- ADMIN TOOLS ---
-async def promote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context): return
-    if update.message.reply_to_message:
+    await query.answer()
+    data = query.data
+
+    if data == 'nuke_cancel':
+        await query.edit_message_text("👍 **Operation Cancelled.**")
+        return
+
+    # Extract number from 'clean_50' -> 50
+    try:
+        count = int(data.split('_')[1])
+    except:
+        return
+
+    await query.edit_message_text(f"☢️ **Deleting last {count} messages...**")
+    
+    chat_id = query.message.chat_id
+    msg_id = query.message.message_id
+    
+    deleted = 0
+    # Loop to delete
+    for i in range(count):
         try:
-            await context.bot.promote_chat_member(update.effective_chat.id, update.message.reply_to_message.from_user.id, can_manage_chat=True, can_delete_messages=True, can_invite_users=True, can_pin_messages=True)
-            await update.message.reply_text("🌟 **Promoted!**")
-        except: await update.message.reply_text("❌ Error.")
+            # Delete message ID going backwards from the command
+            await context.bot.delete_message(chat_id, msg_id - i)
+            deleted += 1
+        except Exception:
+            pass # Skip if message doesn't exist or too old
+        
+    final_msg = await context.bot.send_message(chat_id, f"💥 **Safai Abhiyan Complete!**\nDeleted approx {deleted} messages.")
+    # Delete the confirmation after 5 seconds
+    await asyncio.sleep(5)
+    try:
+        await final_msg.delete()
+    except:
+        pass
+
+# --- ADMIN TOOLS (FIXED) ---
+
+async def promote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context): 
+        return await update.message.reply_text("⛔ Power nahi hai.")
+    
+    if not update.message.reply_to_message:
+        return await update.message.reply_text("Reply karke promote kar.")
+
+    user_id = update.message.reply_to_message.from_user.id
+    chat_id = update.effective_chat.id
+
+    try:
+        # Full Admin Rights (Except adding new admins, restricted by Telegram API for bots usually)
+        await context.bot.promote_chat_member(
+            chat_id=chat_id,
+            user_id=user_id,
+            can_manage_chat=True,
+            can_delete_messages=True,
+            can_manage_video_chats=True,
+            can_restrict_members=True,
+            can_promote_members=False, # Bots often can't grant this
+            can_change_info=True,
+            can_invite_users=True,
+            can_pin_messages=True
+        )
+        await update.message.reply_text("🌟 **Badhai ho!** Banda promote ho gaya.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ **Error:** {e}\n(Shayad mere paas khud power nahi hai ya banda pehle se admin hai)")
 
 async def demote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context): return
-    if update.message.reply_to_message:
-        try:
-            await context.bot.promote_chat_member(update.effective_chat.id, update.message.reply_to_message.from_user.id, can_manage_chat=False, can_delete_messages=False)
-            await update.message.reply_text("🤡 **Demoted!**")
-        except: await update.message.reply_text("❌ Error.")
+    if not await is_admin(update, context): 
+        return await update.message.reply_text("⛔ Power nahi hai.")
+    
+    if not update.message.reply_to_message:
+        return await update.message.reply_text("Reply karke demote kar.")
+
+    user_id = update.message.reply_to_message.from_user.id
+    chat_id = update.effective_chat.id
+
+    try:
+        await context.bot.promote_chat_member(
+            chat_id=chat_id,
+            user_id=user_id,
+            can_manage_chat=False,
+            can_delete_messages=False,
+            can_manage_video_chats=False,
+            can_restrict_members=False,
+            can_promote_members=False,
+            can_change_info=False,
+            can_invite_users=False,
+            can_pin_messages=False
+        )
+        await update.message.reply_text("🤡 **Demoted!** Power chhin li gayi.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ **Error:** {e}")
 
 async def set_slow_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context): return
-    if context.args:
-        try:
-            await context.bot.set_chat_slow_mode_delay(update.effective_chat.id, int(context.args[0]))
-            await update.message.reply_text(f"🐢 Slow Mode: {context.args[0]}s")
-        except: pass
+    if not await is_admin(update, context): 
+        return await update.message.reply_text("⛔ Power nahi hai.")
+    
+    if not context.args:
+        return await update.message.reply_text("Usage: `/setslowmode 10`\nValid values: 0, 10, 30, 60, 300, 900, 3600")
+
+    try:
+        seconds = int(context.args[0])
+        valid_values = [0, 10, 30, 60, 300, 900, 3600]
+        
+        if seconds not in valid_values:
+            return await update.message.reply_text(f"❌ Invalid Number!\nUse only: {valid_values}")
+
+        await context.bot.set_chat_slow_mode_delay(update.effective_chat.id, seconds)
+        if seconds == 0:
+            await update.message.reply_text("🏎️ **Slow Mode Off!**")
+        else:
+            await update.message.reply_text(f"🐢 **Slow Mode Set:** {seconds}s")
+            
+    except ValueError:
+        await update.message.reply_text("❌ Number daal bhai.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
 
 async def pin_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await is_admin(update, context) and update.message.reply_to_message:
-        await update.message.reply_to_message.pin()
+        try:
+            await update.message.reply_to_message.pin()
+            await update.message.reply_text("📌 Pinned.")
+        except Exception as e:
+            await update.message.reply_text(f"Error: {e}")
 
 async def unpin_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await is_admin(update, context) and update.message.reply_to_message:
-        await update.message.reply_to_message.unpin()
+        try:
+            await update.message.reply_to_message.unpin()
+            await update.message.reply_text("📌 Unpinned.")
+        except:
+            pass
 
 # --- UTILS ---
 async def afk(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -179,9 +303,6 @@ async def afk(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def roll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_dice(update.effective_chat.id)
-
-async def bala(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_animation(update.effective_chat.id, "https://media1.tenor.com/m/C3eR0iU1tBIAAAAd/akshay-kumar-dance.gif", caption="🕺 **Bala O Bala!**")
 
 async def set_auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await is_admin(update, context):
@@ -206,32 +327,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text_raw = update.message.text
     text_lower = text_raw.lower()
     
-    # 1. SPECIAL TRIGGER: "Tere Upar Bala" Logic
-    # We create a version of text without spaces or dots
-    # This turns "s.e.v.e.n" -> "seven" and "tu . pi . le" -> "tupile"
+    # 1. SPECIAL TRIGGER: "Tere Upar Bala" Logic (Bot command removed, but trigger kept)
     clean_text = re.sub(r'[\s\.]', '', text_lower) 
     
     triggered_bala = False
-    
-    # Condition A: Number "7" anywhere in raw text (e.g. "7", "7.", "17")
     if "7" in text_raw:
         triggered_bala = True
-        
-    # Condition B: Word "seven" in clean text (e.g. "seven", "s.e.v.e.n", "s ev en")
     elif "seven" in clean_text:
         triggered_bala = True
-        
-    # Condition C: Specific Phrase "tupilepermeramut" in clean text
     elif "tupilepermeramut" in clean_text:
         triggered_bala = True
     
     if triggered_bala:
         await update.message.reply_text("Tere upar Bala")
-        return # Priority: Stop further processing (like abuse check)
+        return # Stop processing abuse check for this fun trigger
 
     # 2. ABUSE FILTER
     found_bad = False
-    # Check strict words first (to avoid partial matches misfiring if needed, but here we do broad check)
     for bad in BAD_WORDS:
         if bad in text_lower:
             found_bad = True
@@ -239,8 +351,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     if found_bad:
         await update.message.reply_text(f"⛔ **Oye {user.first_name}!** Gaali mat de, tameez se reh.")
-        # try: await update.message.delete()
-        # except: pass
 
     # 3. AFK Handler
     if user.id in afk_users:
@@ -265,11 +375,12 @@ if __name__ == '__main__':
         
     app = ApplicationBuilder().token(TOKEN).build()
     
+    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("login", login))
     app.add_handler(CommandHandler("warn", warn_user))
     app.add_handler(CommandHandler("shout", shout))
-    app.add_handler(CommandHandler("nuke", nuke_request))
+    app.add_handler(CommandHandler("nuke", nuke_panel)) # Updated to Panel
     app.add_handler(CommandHandler("promote", promote))
     app.add_handler(CommandHandler("demote", demote))
     app.add_handler(CommandHandler("setslowmode", set_slow_mode))
@@ -277,12 +388,12 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("unpin", unpin_msg))
     app.add_handler(CommandHandler("afk", afk))
     app.add_handler(CommandHandler("roll", roll))
-    app.add_handler(CommandHandler("bala", bala))
     app.add_handler(CommandHandler("setautoreply", set_auto_reply))
     app.add_handler(CommandHandler("deleteautoreply", delete_auto_reply))
 
+    # Handlers
     app.add_handler(CallbackQueryHandler(nuke_callback))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
-    print("🚀 Bot Started with Updated '7/Seven' Logic...")
+    print("🚀 Bot Started with Updated Config...")
     app.run_polling()
