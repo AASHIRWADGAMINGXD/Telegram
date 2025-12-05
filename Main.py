@@ -333,6 +333,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # If it contains a link, we DISABLE the Bala trigger to avoid false alarms
     is_link = re.search(r'(http|https|www\.)', text_lower)
     
+    if not is_link:
     # 1. SPECIAL TRIGGER: "Tere Upar Bala" Logic (Bot command removed, but trigger kept)
     clean_text = re.sub(r'[\s\.]', '', text_lower) 
     
