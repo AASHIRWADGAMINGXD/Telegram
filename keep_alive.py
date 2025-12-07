@@ -10,7 +10,7 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    return "<h1>Bot Zinda Hai! (System Online)</h1>"
+    return "<h1>Bot Zinda Hai (System Online)</h1>"
 
 def run():
     # Use port 8080 or defaults to 5000 if 8080 is busy
