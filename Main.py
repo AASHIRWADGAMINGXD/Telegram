@@ -27,13 +27,14 @@ if not BOT_TOKEN:
     )
 
 # Configuration constants
-AUTH_PASSWORD = "bala ki"  # Change this to a secure password
+AUTH_PASSWORD = "bala"  # Change this to a secure password
 ADMIN_USER_IDS = {
     123456789,
 }  # Add the Telegram User IDs of your admins (integers)
 ADMIN_USERNAMES = {
     "@uchihaitachidesu"
     "@Anantgamingxd"
+    "@AashirwadGamerzz"
 }  # Optional: Add admin usernames (strings)
 
 # Global State
