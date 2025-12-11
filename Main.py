@@ -2,6 +2,8 @@ import os
 import re
 import logging
 import json
+import socket # For the dummy server health check
+from threading import Thread # For running polling and server concurrently
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -13,6 +15,7 @@ from telegram.ext import (
 )
 from functools import wraps
 from typing import Set, Dict, Any
+from flask import Flask # Required for the dummy web server
 
 # --- 1. Configuration & Setup ---
 
@@ -31,7 +34,7 @@ if not BOT_TOKEN:
 
 # Configuration constants
 AUTH_PASSWORD = "bala"  # <--- MUST CHANGE THIS
-ADMIN_USER_IDS: Set[int] = {7915800827,6920845760,1389356052}  # <--- ADD YOUR ADMIN USER IDs
+ADMIN_USER_IDS: Set[int] = {7915800827,6920845760,1389356052,}  # <--- ADD YOUR ADMIN USER IDs
 ADMIN_USERNAMES: Set[str] = {"@your_admin_username"}  # Optional admin usernames
 DATA_FILE = "bot_data.json" # File for persistent storage
 
@@ -328,19 +331,16 @@ async def nuke_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
     chat_id = query.message.chat_id
     current_message_id = query.message.message_id
     
-    # Attempt to delete the requested number of messages backward
     deleted_count = 0
     messages_to_delete = [current_message_id - i for i in range(1, count + 1)]
 
     for msg_id in messages_to_delete:
         try:
-            # Note: Deletion must be within bot's capabilities (admin, age limit)
             await context.bot.delete_message(chat_id, msg_id)
             deleted_count += 1
         except Exception:
             pass 
     
-    # Delete the Nuke panel itself
     try:
         await context.bot.delete_message(chat_id, current_message_id)
     except Exception:
@@ -511,13 +511,35 @@ async def custom_message_handler(update: Update, context: ContextTypes.DEFAULT_T
             await update.message.reply_text(response)
             return
 
-# --- 10. Main Application ---
+# --- 10. Web Server (Dummy) for Hosting Platforms ---
+
+def run_dummy_server():
+    """Runs a basic Flask server on the required port (e.g., 8080) to satisfy the host health check."""
+    # Render or similar services usually provide the PORT via an environment variable
+    port = int(os.environ.get('PORT', 8080))
+    
+    app = Flask('dummy_app')
+
+    @app.route('/')
+    def home():
+        return "Telegram Bot Worker is running.", 200
+
+    print(f"Flask dummy server starting on port {port}...")
+    try:
+        # Run Flask in a non-blocking way
+        app.run(host='0.0.0.0', port=port, debug=False)
+    except socket.error as e:
+        print(f"Error starting Flask server: {e}")
+
+
+# --- 11. Main Application ---
 
 def main() -> None:
-    """Start the bot."""
+    """Start the bot and the dummy server concurrently."""
     
     load_data() # Load persistent data at startup
 
+    # --- 1. Start the Bot Polling Application ---
     application = Application.builder().token(BOT_TOKEN).build()
 
     # Handlers Setup
@@ -541,13 +563,18 @@ def main() -> None:
     application.add_handler(CommandHandler("block", block_command))
     application.add_handler(CommandHandler("unblock", unblock_command))
     
-    # MUST BE LAST: Message Handler for Thala, YouTube, Auto-Replies
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, custom_message_handler)
     )
 
+    # --- 2. Start the Dummy Web Server in a separate thread ---
+    # This solves the "Port scan timeout" issue on Web Service deployments.
+    server_thread = Thread(target=run_dummy_server)
+    server_thread.daemon = True 
+    server_thread.start()
+
+    # --- 3. Start Polling (Main Bot Logic) ---
     logger.info("Bot is starting polling...")
-    # application.run_polling() handles the keep-alive for the bot connection.
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
