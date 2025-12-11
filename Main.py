@@ -2,11 +2,12 @@ import os
 import re
 import logging
 import json
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
@@ -29,8 +30,8 @@ if not BOT_TOKEN:
     )
 
 # Configuration constants
-AUTH_PASSWORD = "bala"  # CHANGE THIS!
-ADMIN_USER_IDS: Set[int] = {7915800827,6920845760,1389356052} # Add your admin User IDs (integers)
+AUTH_PASSWORD = "bala"  # <--- MUST CHANGE THIS
+ADMIN_USER_IDS: Set[int] = {7915800827,6920845760,1389356052}  # <--- ADD YOUR ADMIN USER IDs
 ADMIN_USERNAMES: Set[str] = {"@your_admin_username"}  # Optional admin usernames
 DATA_FILE = "bot_data.json" # File for persistent storage
 
@@ -50,12 +51,8 @@ def load_data() -> None:
                 data: Dict[str, Any] = json.load(f)
                 
                 # Convert list of strings back to set of integers for user IDs
-                auth_list = data.get('authenticated_users', [])
-                authenticated_users = set(map(int, auth_list))
-                
-                blocked_list = data.get('blocked_users', [])
-                blocked_users = set(map(int, blocked_list))
-                
+                authenticated_users = set(map(int, data.get('authenticated_users', [])))
+                blocked_users = set(map(int, data.get('blocked_users', [])))
                 auto_replies = data.get('auto_replies', {})
             logger.info(f"Bot data loaded successfully. {len(authenticated_users)} users authenticated.")
         except json.JSONDecodeError as e:
@@ -86,9 +83,10 @@ def check_auth(func):
     """Decorator to restrict access to authenticated users."""
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if user_id not in authenticated_users:
-            await update.message.reply_text(
+        user = update.effective_user
+        if not user or user.id not in authenticated_users:
+            message_source = update.callback_query or update.message
+            await message_source.reply_text(
                 "💀 *Access Denied, Mere Dost.*\n"
                 "Pehle *password* de, phir baat kar.\n"
                 "Use the command: `/login <password>`",
@@ -104,11 +102,15 @@ def check_admin(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
+        if not user:
+            return
+            
         is_admin = (
             user.id in ADMIN_USER_IDS or user.username in ADMIN_USERNAMES
         )
         if not is_admin:
-            await update.message.reply_text(
+            message_source = update.callback_query or update.message
+            await message_source.reply_text(
                 "❌ *Hatt Ja, Chhote!*\n"
                 "Yeh tera **baap** wala kaam hai. Admin permission chahiyye.",
                 parse_mode="Markdown",
@@ -116,7 +118,6 @@ def check_admin(func):
             return
         return await func(update, context)
     return wrapper
-
 
 # --- 4. Core Handlers: Auth & Info ---
 
@@ -126,7 +127,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if user_id in authenticated_users:
         await update.message.reply_text(
             "✅ *Welcome back, Boss!* *Session Abhi Bhi Chalu Hai.*\n"
-            "Tu *fully loaded* hai. Commands maar, *System* hila de.",
+            "Tu *fully loaded* hai. Commands maar, *System* hila de. Commands ke liye `/help`.",
             parse_mode="Markdown",
         )
     else:
@@ -135,6 +136,29 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "Sabse pehle, *login* kar. Command: `/login <password>`",
             parse_mode="Markdown",
         )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Provides a list of all commands."""
+    help_message = (
+        "📜 **Command List (Tera System)**\n\n"
+        "**Access (Sabke Liye):**\n"
+        "`/start` - Check status, *shuruaat*.\n"
+        "`/login <pass>` - *Andar aao*, session chalu karo.\n"
+        "`/logout` - *Bahar jao*, session khatam karo.\n\n"
+        "**Mods & Control (Admin Chahiye):**\n"
+        "`/kick` (Reply) - *Dhaka de*.\n"
+        "`/ban` (Reply) - *Hamesha ke liye bhagao*.\n"
+        "`/mute` (Reply) - *Chup karao* (5 min).\n"
+        "`/del` (Reply) - *Mita do*.\n"
+        "`/nuke` - *Pain Mode* on, bulk delete panel.\n\n"
+        "**Custom & Broadcast (Auth Chahiye):**\n"
+        "`/shout <msg>` - *Zor se bolo* (strict filter ke saath).\n"
+        "`/addreply <trigger> <response>` - *Naya jawab set karo*.\n"
+        "`/delreply <trigger>` - *Jawab hatao*.\n"
+        "`/block` (Reply) - User ko bot se *baat karne se roko*.\n"
+        "`/unblock` (Reply) - Block *hatao*.\n"
+    )
+    await update.message.reply_text(help_message, parse_mode="Markdown")
 
 
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -149,7 +173,7 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     authenticated_users.add(user_id)
-    save_data() # Save state after successful login
+    save_data() 
     await update.message.reply_text(
         "✅ *Welcome back, Boss!* *Aaya Tu!*\n"
         "Ab tu *fully loaded* hai. Commands maar, *System* hila de.",
@@ -162,13 +186,12 @@ async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
     if user_id in authenticated_users:
         authenticated_users.remove(user_id)
-        save_data() # Save state after successful logout
+        save_data() 
         await update.message.reply_text(
             "👋 *Theek Hai, Ja.* Tera *session* khatam. Agli baar *password* laana."
         )
     else:
         await update.message.reply_text("🤔 *Tu Pehle Se Hi Bahar Hai.*")
-
 
 # --- 5. Moderation Handlers ---
 
@@ -190,9 +213,9 @@ async def kick_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"💥 *BAHAR!* **{target_user.full_name}** ko *dhakka* de diya.",
             parse_mode="Markdown",
         )
-    except Exception:
+    except Exception as e:
+        logger.error(f"Kick error: {e}")
         await update.message.reply_text("❌ *Kuchh Gadbad Hai!* Ya toh main admin nahi, ya yeh banda *bada aadmi* hai.")
-
 
 @check_auth
 @check_admin
@@ -211,9 +234,9 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"🔨 *PAKKA BAN!* **{target_user.full_name}** *sada* ke liye gaya.",
             parse_mode="Markdown",
         )
-    except Exception:
+    except Exception as e:
+        logger.error(f"Ban error: {e}")
         await update.message.reply_text("❌ *Kuchh Gadbad Hai!*")
-
 
 @check_auth
 @check_admin
@@ -238,7 +261,8 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"🤫 *SHHH!* **{target_user.full_name}** ko *chuppi* de di. 5 minute *baad* aana.",
             parse_mode="Markdown",
         )
-    except Exception:
+    except Exception as e:
+        logger.error(f"Mute error: {e}")
         await update.message.reply_text("❌ *Mute nahi hua, Boss!*")
 
 @check_auth
@@ -249,9 +273,11 @@ async def del_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             await update.message.reply_to_message.delete()
             await update.message.delete()
+            # Send a silent confirmation that self-deletes shortly after
             await context.bot.send_message(
                 update.effective_chat.id, 
-                "🗑️ *Tabaah!*"
+                "🗑️ *Tabaah!*",
+                message_thread_id=update.message.message_thread_id if update.message.message_thread_id else None,
             )
         except Exception:
             await context.bot.send_message(
@@ -259,17 +285,75 @@ async def del_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "❌ *Delete Failed.* Admin rights confirm kar."
             )
 
+# --- 6. Nuke Command ---
+
 @check_auth
 @check_admin
 async def nuke_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Naruto Pain themed message deletion interface (symbolic)."""
+    """Deletes messages using button options (Naruto Pain themed)."""
+    
+    nuke_options = [
+        [InlineKeyboardButton("10 Messages", callback_data='nuke_10')],
+        [InlineKeyboardButton("20 Messages", callback_data='nuke_20')],
+        [InlineKeyboardButton("500 Messages", callback_data='nuke_500')],
+        [InlineKeyboardButton("1000 Messages", callback_data='nuke_1000')]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(nuke_options)
+
     await update.message.reply_text(
-        "🌀 *Shinra Tensei... Message Deletion Panel Activated!* \n"
-        "Abhi *full-scale Nuke* chalu nahi hua. Filhaal, *reply* kar /del se.",
-        parse_mode="Markdown",
+        "🌀 **Shinra Tensei: Message Deletion Panel Activated!** \n\n"
+        "Kitne *sandese* (messages) ko *raakh* (ash) karna hai, **Boss**?",
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
     )
 
-# --- 6. Shout Command (With Complex Restriction) ---
+@check_auth
+@check_admin
+async def nuke_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles button clicks from the Nuke panel."""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    if not data.startswith('nuke_'):
+        return
+
+    try:
+        count = int(data.split('_')[1])
+    except ValueError:
+        await query.edit_message_text("❌ *Bhai, Error Hua.* Number sahi nahi mila.")
+        return
+
+    chat_id = query.message.chat_id
+    current_message_id = query.message.message_id
+    
+    # Attempt to delete the requested number of messages backward
+    deleted_count = 0
+    messages_to_delete = [current_message_id - i for i in range(1, count + 1)]
+
+    for msg_id in messages_to_delete:
+        try:
+            # Note: Deletion must be within bot's capabilities (admin, age limit)
+            await context.bot.delete_message(chat_id, msg_id)
+            deleted_count += 1
+        except Exception:
+            pass 
+    
+    # Delete the Nuke panel itself
+    try:
+        await context.bot.delete_message(chat_id, current_message_id)
+    except Exception:
+        pass
+
+    await context.bot.send_message(
+        chat_id,
+        f"💥 **Nuke Successful!** *Pain* ne **{deleted_count}** *sandese* (messages) *raakh* kar diye.",
+        parse_mode="Markdown"
+    )
+
+
+# --- 7. Shout Command ---
 
 @check_auth
 @check_admin
@@ -280,19 +364,12 @@ async def shout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     message_text = " ".join(context.args)
-    restricted_words = {"aashirwad ki", "sp ki", "anant ki", "jhaa ki"}
+    restricted_phrases = {"aashirwad ki", "sp ki", "anant ki", "jhaa ki", "levi ki"}
     
-    for word in restricted_words:
-        # Create a regex pattern to match the word with optional dots or spaces between characters
-        # e.g., 'a.a.s.h.i.r.w.a.d .k i'
-        pattern = re.escape(word.replace(' ', '')) # Base word without spaces
-        
-        # Insert optional non-letter/non-digit characters (including dot/space) between every character
-        # Example: 'a' becomes 'a[.\s]*'
-        pattern_with_noise = r'[.\s]*'.join(list(pattern)) 
-        
-        # Optionally allow spaces around the full word match
-        final_pattern = r'\b' + pattern_with_noise + r'\b'
+    for phrase in restricted_phrases:
+        # Regex to match the phrase with optional dots/spaces between characters
+        char_pattern = r'[.\s]*'.join(re.escape(c) for c in phrase if c != ' ')
+        final_pattern = r'\b' + char_pattern + r'\b'
         
         if re.search(final_pattern, message_text, re.IGNORECASE):
             await update.message.reply_text(
@@ -310,7 +387,7 @@ async def shout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         pass
 
 
-# --- 7. Auto-Reply Handlers ---
+# --- 8. Auto-Reply & Block/Unblock Handlers ---
 
 @check_auth
 async def add_reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -322,13 +399,12 @@ async def add_reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     trigger = context.args[0].lower()
     response = " ".join(context.args[1:])
     auto_replies[trigger] = response
-    save_data() # Save state
+    save_data() 
     
     await update.message.reply_text(
         f"🎯 *Auto-Reply Set!* Trigger: *{trigger.upper()}*",
         parse_mode="Markdown"
     )
-
 
 @check_auth
 async def delete_reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -340,13 +416,10 @@ async def delete_reply_command(update: Update, context: ContextTypes.DEFAULT_TYP
     trigger = context.args[0].lower()
     if trigger in auto_replies:
         del auto_replies[trigger]
-        save_data() # Save state
+        save_data() 
         await update.message.reply_text(f"✅ *Reply Deleted!* *{trigger.upper()}* ab *chup* rahega.", parse_mode="Markdown")
     else:
         await update.message.reply_text(f"🤔 *Yeh Trigger Mila Hi Nahi.*")
-
-
-# --- 8. Block/Unblock Handlers ---
 
 @check_auth
 @check_admin
@@ -362,7 +435,7 @@ async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     
     blocked_users.add(target_id)
-    save_data() # Save state
+    save_data() 
     await update.message.reply_text(
         f"🚫 *BLOCK!* **{update.message.reply_to_message.from_user.full_name}** ab *bot* se baat nahi kar sakta.",
         parse_mode="Markdown"
@@ -380,7 +453,7 @@ async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     if target_id in blocked_users:
         blocked_users.remove(target_id)
-        save_data() # Save state
+        save_data() 
         await update.message.reply_text(
             f"🔓 *UNBLOCK!* **{update.message.reply_to_message.from_user.full_name}** *wapis aa gaya*.",
             parse_mode="Markdown"
@@ -388,21 +461,10 @@ async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         await update.message.reply_text("🤷‍♂️ *Yeh Banda Blocked Nahi Tha.*")
 
-
-# --- 9. AI and Custom Message Handler ---
-
-async def ai_response_placeholder(text: str) -> str:
-    """Simulates an AI-powered, bilingual, gangster-mixed response."""
-    # Integrate your actual AI API here.
-    
-    if "kya haal" in text.lower() or "how are you" in text.lower():
-        return "Bhai, *mast*! Tu bata, *system* kaisa hai? Sab *changa*?"
-    
-    return f"Aye, *sahi baat*! *Main* samajh gaya. **Chal Hata!**"
-
+# --- 9. Custom Message Handler ---
 
 async def custom_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles blocked users, Thala logic, auto-replies, and AI responses."""
+    """Handles blocked users, Thala logic, YouTube filter (ignore), and auto-replies."""
     if not update.message or not update.message.text:
         return
 
@@ -411,43 +473,43 @@ async def custom_message_handler(update: Update, context: ContextTypes.DEFAULT_T
     
     # 1. Blocked User Check
     if user_id in blocked_users:
-        return # Silently ignore
+        return 
     
-    # 2. Thala Logic (Complex Rule)
+    # 2. YouTube Link Filter (If '7' is present, DO NOTHING/ALLOW)
+    youtube_pattern = r'(?:https?://)?(?:www\.)?(?:youtube\.com|youtu\.be)/(?:watch\?v=)?[\w\-_]+'
+    youtube_links = re.findall(youtube_pattern, message_text, re.IGNORECASE)
+    
+    for link in youtube_links:
+        if '7' in link:
+            # We explicitly skip any action, allowing the message to pass through.
+            logger.info(f"YouTube link with '7' detected: {link}. Allowed as per user request.")
+            pass 
+
+
+    # 3. Thala Logic (Fixed)
     if re.search(r"Thala", message_text, re.IGNORECASE):
         # Check if dot or space is present
         dot_or_space_present = re.search(r"[.\s]", message_text)
         
-        # Remove all spaces and dots to check for length 7
-        text_cleaned_for_7 = re.sub(r'[\s.]', '', message_text) 
+        # Remove all non-alphanumeric characters for the length check
+        text_cleaned_for_7 = re.sub(r'[^a-zA-Z0-9]', '', message_text) 
         
+        # Check if 'Thala' is present AND dot/space is present
         if dot_or_space_present:
+            response = "👑 **Tere Upar Bala Send**"
+            
+            # Check for the magic number 7 in the cleaned text length
             if len(text_cleaned_for_7) == 7:
-                await update.message.reply_text(
-                    "👑 *THALA FOR A REASON!* \n"
-                    "**Tere Upar Bala Send**\n"
-                    "Aur Sun, *7 Detected*, Bhai! *Perfect*!"
-                )
-            else:
-                await update.message.reply_text("👑 **Tere Upar Bala Send**")
+                response += "\nAur Sun, *7 Detected*, Bhai! *Perfect*!"
+            
+            await update.message.reply_text(response, parse_mode="Markdown")
             return
 
-    # 3. Auto-Reply System
+    # 4. Auto-Reply System
     for trigger, response in auto_replies.items():
         if trigger in message_text.lower():
             await update.message.reply_text(response)
             return
-
-    # 4. AI-Powered Responses (Only for authenticated users, if replied to bot or mentions bot)
-    if user_id in authenticated_users:
-        bot_mention = context.bot.username in message_text if context.bot.username else False
-        is_reply = (update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id)
-
-        if is_reply or bot_mention:
-            response = await ai_response_placeholder(message_text)
-            await update.message.reply_text(response, parse_mode="Markdown")
-            return
-
 
 # --- 10. Main Application ---
 
@@ -460,6 +522,7 @@ def main() -> None:
 
     # Handlers Setup
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command)) 
     application.add_handler(CommandHandler("login", login_command))
     application.add_handler(CommandHandler("logout", logout_command))
 
@@ -469,6 +532,7 @@ def main() -> None:
     
     application.add_handler(CommandHandler("shout", shout_command))
     application.add_handler(CommandHandler("nuke", nuke_command))
+    application.add_handler(CallbackQueryHandler(nuke_callback_handler, pattern=r'^nuke_')) 
     application.add_handler(CommandHandler("del", del_command)) 
 
     application.add_handler(CommandHandler("addreply", add_reply_command))
@@ -477,12 +541,13 @@ def main() -> None:
     application.add_handler(CommandHandler("block", block_command))
     application.add_handler(CommandHandler("unblock", unblock_command))
     
-    # MUST BE LAST: Message Handler for Thala, Auto-Replies, and AI
+    # MUST BE LAST: Message Handler for Thala, YouTube, Auto-Replies
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, custom_message_handler)
     )
 
     logger.info("Bot is starting polling...")
+    # application.run_polling() handles the keep-alive for the bot connection.
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
