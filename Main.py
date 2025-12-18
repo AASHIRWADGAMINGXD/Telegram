@@ -1,7 +1,7 @@
 import os
 import asyncio
 from telegram import Update, ChatPermissions
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, JobQueue
 from telegram.error import BadRequest
 
 # Environment variables
@@ -144,10 +144,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(response)
             break
 
-async def keep_alive():
-    while True:
-        await asyncio.sleep(300)  # Ping every 5 minutes to keep alive
-        print("Bot is alive.")
+async def keep_alive_job(context: ContextTypes.DEFAULT_TYPE):
+    print("Bot is alive.")
 
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
@@ -164,8 +162,9 @@ def main():
     application.add_handler(MessageHandler(filters.Regex(r'^remove auto reply'), remove_auto_reply))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Start keep-alive task
-    asyncio.create_task(keep_alive())
+    # Add keep-alive job (runs every 300 seconds)
+    job_queue = application.job_queue
+    job_queue.run_repeating(keep_alive_job, interval=300, first=0)
 
     application.run_polling()
 
