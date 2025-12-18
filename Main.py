@@ -1,172 +1,262 @@
+import telebot
 import os
-import asyncio
-from telegram import Update, ChatPermissions
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, JobQueue
-from telegram.error import BadRequest
+import threading
+import time
+from datetime import datetime, timedelta
 
 # Environment variables
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD')
+ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'defaultpass')  # Change this in env or hardcode securely
 
-# Global data structures
-blocked_users = set()  # Users blocked from bot
-auto_replies = {}  # Dict of trigger: response
-logged_in_users = set()  # Users who have logged in
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable is required.")
 
-async def is_admin(update: Update) -> bool:
-    return update.effective_user.id in logged_in_users
+bot = telebot.TeleBot(BOT_TOKEN)
 
-async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        await update.message.reply_text("Access denied. Use /login [password] to authenticate.")
-        return
-    chat_id = update.effective_chat.id
+# Global sets/dicts
+admins = set()
+blocked = set()
+muted = set()  # For permanent mute (deletes messages)
+auto_replies = {}  # keyword: reply_text
+
+def is_admin(user_id):
+    return user_id in admins
+
+def is_allowed(user_id):
+    return user_id not in blocked
+
+# Keep-alive mechanism (simple thread to prevent idle timeout on some hosts)
+def keep_alive():
+    while True:
+        print(f"Bot alive at {datetime.now()}")
+        time.sleep(60)  # Ping every minute
+
+keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
+keep_alive_thread.start()
+
+# Block handler: Ignore blocked users' non-command messages
+@bot.message_handler(func=lambda m: not m.is_command() and m.from_user.id in blocked)
+def ignore_blocked(m):
+    pass  # Do nothing
+
+# Mute handler: Delete muted users' messages
+@bot.message_handler(func=lambda m: not m.is_command() and m.from_user.id in muted)
+def delete_muted(m):
     try:
-        # Delete recent messages (Telegram limits to 100 per call, and only bot's own messages or in channels)
-        messages = await context.bot.get_chat_history(chat_id, limit=100)
-        for msg in messages:
-            if msg.message_id != update.message.message_id:  # Don't delete the command itself
-                await context.bot.delete_message(chat_id, msg.message_id)
-        await update.message.reply_text("Chat cleared (recent messages deleted).")
-    except BadRequest:
-        await update.message.reply_text("Unable to clear chat (insufficient permissions).")
+        bot.delete_message(m.chat.id, m.message_id)
+    except Exception as e:
+        print(f"Failed to delete muted message: {e}")
 
-async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        await update.message.reply_text("Access denied.")
+# Auto-reply handler for non-command messages
+@bot.message_handler(func=lambda m: not m.is_command() and is_allowed(m.from_user.id))
+def handle_auto_reply(m):
+    if not m.text:
         return
-    if not context.args:
-        await update.message.reply_text("Usage: /mute @username or user_id")
-        return
-    user = context.args[0]
-    chat_id = update.effective_chat.id
-    try:
-        await context.bot.restrict_chat_member(chat_id, user, ChatPermissions(can_send_messages=False))
-        await update.message.reply_text(f"User {user} muted.")
-    except BadRequest:
-        await update.message.reply_text("Failed to mute user.")
+    text_lower = m.text.lower()
+    for keyword, reply_text in auto_replies.items():
+        if keyword in text_lower:
+            bot.reply_to(m, reply_text)
+            return  # Only one reply per message for simplicity
 
-async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        await update.message.reply_text("Access denied.")
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /ban @username or user_id")
-        return
-    user = context.args[0]
-    chat_id = update.effective_chat.id
-    try:
-        await context.bot.ban_chat_member(chat_id, user)
-        await update.message.reply_text(f"User {user} banned.")
-    except BadRequest:
-        await update.message.reply_text("Failed to ban user.")
-
-async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        await update.message.reply_text("Access denied.")
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /kick @username or user_id")
-        return
-    user = context.args[0]
-    chat_id = update.effective_chat.id
-    try:
-        await context.bot.ban_chat_member(chat_id, user)
-        await context.bot.unban_chat_member(chat_id, user)  # Unban to allow rejoin
-        await update.message.reply_text(f"User {user} kicked.")
-    except BadRequest:
-        await update.message.reply_text("Failed to kick user.")
-
-async def block(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        await update.message.reply_text("Access denied.")
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: block @username or user_id")
-        return
-    user_id = int(context.args[0].lstrip('@')) if context.args[0].startswith('@') else int(context.args[0])
-    blocked_users.add(user_id)
-    await update.message.reply_text(f"User {user_id} blocked from bot.")
-
-async def add_auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        await update.message.reply_text("Access denied.")
-        return
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("Usage: add auto reply [trigger] [response]")
-        return
-    trigger = args[0]
-    response = ' '.join(args[1:])
-    auto_replies[trigger.lower()] = response
-    await update.message.reply_text(f"Auto-reply added for '{trigger}'.")
-
-async def remove_auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        await update.message.reply_text("Access denied.")
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: remove auto reply [trigger]")
-        return
-    trigger = context.args[0].lower()
-    if trigger in auto_replies:
-        del auto_replies[trigger]
-        await update.message.reply_text(f"Auto-reply removed for '{trigger}'.")
+@bot.message_handler(commands=['start'])
+def start(message):
+    user_id = message.from_user.id
+    if message.chat.type == 'private':
+        bot.reply_to(message, "Welcome! Use /login <password> in private chat to gain admin access.\n\nAdmin commands:\n/clear [count] - Clear recent messages\n/mute <user_id> - Mute user (delete their messages)\n/unmute <user_id> - Unmute user\n/ban <user_id> - Ban user from group\n/kick <user_id> - Kick user from group\n/block <user_id> - Block user from bot\n/unblock <user_id> - Unblock user\n/add_auto_reply <keyword> <reply_text> - Add auto reply\n/remove_auto_reply <keyword> - Remove auto reply\n/removeuser <user_id> - Logout a user")
     else:
-        await update.message.reply_text("No auto-reply found for that trigger.")
+        bot.reply_to(message, "Bot started. Admins, use commands accordingly.")
 
-async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args or context.args[0] != ADMIN_PASSWORD:
-        await update.message.reply_text("Invalid password.")
+@bot.message_handler(commands=['login'])
+def login(message):
+    if message.chat.type != 'private':
+        bot.reply_to(message, "Please use /login in a private chat with the bot.")
         return
-    user_id = update.effective_user.id
-    logged_in_users.add(user_id)
-    await update.message.reply_text("Logged in. You now have full access.")
-
-async def removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        await update.message.reply_text("Access denied.")
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /login <password>")
         return
-    if not context.args:
-        await update.message.reply_text("Usage: /removeuser @username or user_id")
+    if parts[1] == ADMIN_PASSWORD:
+        admins.add(message.from_user.id)
+        bot.reply_to(message, "✅ Logged in successfully. You now have admin access.")
+    else:
+        bot.reply_to(message, "❌ Wrong password.")
+
+@bot.message_handler(commands=['removeuser'])
+def removeuser(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
         return
-    user_id = int(context.args[0].lstrip('@')) if context.args[0].startswith('@') else int(context.args[0])
-    logged_in_users.discard(user_id)
-    await update.message.reply_text(f"User {user_id} logged out.")
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /removeuser <user_id>")
+        return
+    try:
+        target_id = int(parts[1])
+        if target_id in admins:
+            admins.remove(target_id)
+            bot.reply_to(message, f"✅ Removed admin access for user {target_id}.")
+        else:
+            bot.reply_to(message, "❌ User is not an admin.")
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid user ID. Must be a number.")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in blocked_users:
-        return  # Ignore blocked users
-    text = update.message.text.lower()
-    for trigger, response in auto_replies.items():
-        if trigger in text:
-            await update.message.reply_text(response)
-            break
+@bot.message_handler(commands=['clear'])
+def clear_messages(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    parts = message.text.split()
+    try:
+        count = int(parts[1]) if len(parts) > 1 else 10  # Default 10 messages
+    except ValueError:
+        count = 10
+        bot.reply_to(message, "Invalid count, using default 10.")
+    chat_id = message.chat.id
+    msg_id = message.message_id
+    deleted = 0
+    for i in range(count):
+        try:
+            bot.delete_message(chat_id, msg_id - i)
+            deleted += 1
+        except Exception:
+            pass  # Ignore if can't delete (e.g., too old)
+    bot.reply_to(message, f"🧹 Cleared {deleted} messages.", delete_after=3)
 
-async def keep_alive_job(context: ContextTypes.DEFAULT_TYPE):
-    print("Bot is alive.")
+@bot.message_handler(commands=['mute'])
+def mute_user(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /mute <user_id>")
+        return
+    try:
+        target_id = int(parts[1])
+        muted.add(target_id)
+        bot.reply_to(message, f"🔇 Muted user {target_id} (messages will be deleted).")
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid user ID.")
 
-def main():
-    application = Application.builder().token(BOT_TOKEN).build()
+@bot.message_handler(commands=['unmute'])
+def unmute_user(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /unmute <user_id>")
+        return
+    try:
+        target_id = int(parts[1])
+        muted.discard(target_id)
+        bot.reply_to(message, f"🔊 Unmuted user {target_id}.")
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid user ID.")
 
-    # Handlers
-    application.add_handler(CommandHandler("clear", clear))
-    application.add_handler(CommandHandler("mute", mute))
-    application.add_handler(CommandHandler("ban", ban))
-    application.add_handler(CommandHandler("kick", kick))
-    application.add_handler(CommandHandler("login", login))
-    application.add_handler(CommandHandler("removeuser", removeuser))
-    application.add_handler(MessageHandler(filters.Regex(r'^block'), block))
-    application.add_handler(MessageHandler(filters.Regex(r'^add auto reply'), add_auto_reply))
-    application.add_handler(MessageHandler(filters.Regex(r'^remove auto reply'), remove_auto_reply))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+@bot.message_handler(commands=['ban'])
+def ban_user(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /ban <user_id> (in group)")
+        return
+    try:
+        target_id = int(parts[1])
+        bot.ban_chat_member(message.chat.id, target_id)
+        bot.reply_to(message, f"🚫 Banned user {target_id} from group.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Failed to ban: {str(e)}")
 
-    # Add keep-alive job (runs every 300 seconds)
-    job_queue = application.job_queue
-    job_queue.run_repeating(keep_alive_job, interval=300, first=0)
+@bot.message_handler(commands=['kick'])
+def kick_user(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /kick <user_id> (in group)")
+        return
+    try:
+        target_id = int(parts[1])
+        chat_id = message.chat.id
+        bot.ban_chat_member(chat_id, target_id)
+        bot.unban_chat_member(chat_id, target_id)
+        bot.reply_to(message, f"👢 Kicked user {target_id} from group.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Failed to kick: {str(e)}")
 
-    application.run_polling()
+@bot.message_handler(commands=['block'])
+def block_user(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /block <user_id>")
+        return
+    try:
+        target_id = int(parts[1])
+        blocked.add(target_id)
+        bot.reply_to(message, f"⛔ Blocked user {target_id} from using the bot.")
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid user ID.")
+
+@bot.message_handler(commands=['unblock'])
+def unblock_user(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /unblock <user_id>")
+        return
+    try:
+        target_id = int(parts[1])
+        blocked.discard(target_id)
+        bot.reply_to(message, f"✅ Unblocked user {target_id}.")
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid user ID.")
+
+@bot.message_handler(commands=['add_auto_reply'])
+def add_auto_reply(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) != 3:
+        bot.reply_to(message, "Usage: /add_auto_reply <keyword> <reply_text>")
+        return
+    keyword = parts[1].lower()
+    reply_text = parts[2]
+    auto_replies[keyword] = reply_text
+    bot.reply_to(message, f"✅ Added auto-reply: '{keyword}' -> '{reply_text}'")
+
+@bot.message_handler(commands=['remove_auto_reply'])
+def remove_auto_reply(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /remove_auto_reply <keyword>")
+        return
+    keyword = parts[1].lower()
+    if keyword in auto_replies:
+        del auto_replies[keyword]
+        bot.reply_to(message, f"✅ Removed auto-reply for '{keyword}'.")
+    else:
+        bot.reply_to(message, f"❌ No auto-reply found for '{keyword}'.")
+
+# Error handler
+@bot.message_handler(func=lambda message: True)
+def handle_all(message):
+    if message.from_user.id not in admins and not message.is_command():
+        # Optional: Delete non-admin non-command messages? But not implemented for now.
+        pass
 
 if __name__ == '__main__':
-    main()
+    print("Bot starting...")
+    bot.infinity_polling(none_stop=True, interval=1, timeout=20)
