@@ -63,7 +63,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚡ /block (Reply) - Block user from bot\n"
         "⚡ /shout <msg> - Yell\n"
         "⚡ /autoreply <trigger> | <response>\n"
-        "⚡ /deleteautorelpy <trigger>\n\n"
+        "⚡ /deleteautoreply <trigger>\n\n"
         "Dattebayo!",
         parse_mode=ParseMode.MARKDOWN
     )
@@ -243,4 +243,17 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ban", ban))
     app.add_handler(CommandHandler("kick", kick))
-    app.add_handler(CommandHandler("mute"
+    app.add_handler(CommandHandler("mute", mute))
+    app.add_handler(CommandHandler("nuke", nuke))
+    app.add_handler(CommandHandler("shout", shout))
+    app.add_handler(CommandHandler("block", block_user))
+    app.add_handler(CommandHandler("autoreply", autoreply))
+    app.add_handler(CommandHandler("deleteautoreply", delete_autoreply))
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    print("Shinobi Bot is running... Dattebayo!")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
