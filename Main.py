@@ -4,11 +4,11 @@ import logging
 import asyncio
 from telegram import Update, ChatPermissions
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from keep_alive import keep_alive
 
 # --- CONFIGURATION ---
-# Load Token from Environment Variable for Security
 TOKEN = os.environ.get("BOT_TOKEN")
 
 # Setup Logging
@@ -18,7 +18,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- PERSISTENCE (JSON) ---
+# --- PERSISTENCE LAYER ---
 DB_FILE = "storage.json"
 
 def load_data():
@@ -34,227 +34,213 @@ def save_data(data):
     with open(DB_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
-# --- HELPER: CHECK ADMIN ---
+# --- ADMIN HELPER ---
 async def is_admin(update: Update) -> bool:
-    """Checks if the user triggering the command is an admin."""
-    if not update.effective_chat or not update.effective_user:
+    """Checks if the user is an admin or creator."""
+    if not update.effective_chat:
         return False
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    
+    if update.effective_chat.type == "private":
+        return True # Owner is admin in DM
+        
     try:
+        user_id = update.effective_user.id
         member = await update.effective_chat.get_member(user_id)
         return member.status in ['administrator', 'creator']
     except Exception as e:
-        logger.error(f"Error checking admin: {e}")
+        logger.error(f"Admin Check Error: {e}")
         return False
 
-# --- COMMANDS: PAIN THEME (Admin/Punishment) ---
+# --- COMMANDS ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👁️ **The cycle of hatred begins...**\n\n"
+        "I am online. My commands:\n"
+        "⚡ /ban (Reply) - Shinra Tensei\n"
+        "⚡ /kick (Reply) - Begone\n"
+        "⚡ /mute (Reply) - Chibaku Tensei\n"
+        "⚡ /nuke <num> - Almighty Push\n"
+        "⚡ /block (Reply) - Block user from bot\n"
+        "⚡ /shout <msg> - Yell\n"
+        "⚡ /autoreply <trigger> | <response>\n"
+        "⚡ /deleteautorelpy <trigger>\n\n"
+        "Dattebayo!",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update):
-        await update.message.reply_text("❌ You lack the visual prowess (Admin rights) for this.")
+        await update.message.reply_text("❌ You lack the visual prowess.")
         return
-
     if not update.message.reply_to_message:
-        await update.message.reply_text("Please reply to a shinobi to execute **Shinra Tensei** (Ban).", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("Reply to a ninja to ban them.")
         return
 
-    user_to_ban = update.message.reply_to_message.from_user
+    user = update.message.reply_to_message.from_user
     try:
-        await update.effective_chat.ban_member(user_to_ban.id)
-        await update.message.reply_text(f"🛑 **SHINRA TENSEI!**\n{user_to_ban.first_name} has been purged from this world.", parse_mode=ParseMode.MARKDOWN)
+        await update.effective_chat.ban_member(user.id)
+        await update.message.reply_text(f"🛑 **SHINRA TENSEI!**\n{user.first_name} has been purged.")
     except Exception as e:
         await update.message.reply_text(f"Failed to ban: {e}")
 
 async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        await update.message.reply_text("❌ You are too weak to use this jutsu.")
-        return
-
+    if not await is_admin(update): return
     if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a user to kick them.")
+        await update.message.reply_text("Reply to a ninja to kick them.")
         return
 
-    user_to_kick = update.message.reply_to_message.from_user
+    user = update.message.reply_to_message.from_user
     try:
-        await update.effective_chat.unban_member(user_to_kick.id) # Unban effectively kicks if not already banned
-        await update.message.reply_text(f"🦶 **Begone!**\n{user_to_kick.first_name} was kicked. Know Pain.", parse_mode=ParseMode.MARKDOWN)
+        await update.effective_chat.unban_member(user.id)
+        await update.message.reply_text(f"🦶 **Begone!**\n{user.first_name} was kicked.")
     except Exception as e:
         await update.message.reply_text(f"Failed to kick: {e}")
 
 async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        await update.message.reply_text("❌ You do not possess the Rinnegan.")
-        return
-
+    if not await is_admin(update): return
     if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a user to seal their voice.")
+        await update.message.reply_text("Reply to a ninja to silence them.")
         return
 
-    user_to_mute = update.message.reply_to_message.from_user
+    user = update.message.reply_to_message.from_user
     permissions = ChatPermissions(can_send_messages=False)
-    
     try:
-        await update.effective_chat.restrict_member(user_to_mute.id, permissions=permissions)
-        await update.message.reply_text(f"🔇 **Chibaku Tensei!**\n{user_to_mute.first_name} has been silenced.", parse_mode=ParseMode.MARKDOWN)
+        await update.effective_chat.restrict_member(user.id, permissions=permissions)
+        await update.message.reply_text(f"🔇 **Chibaku Tensei!**\n{user.first_name} is silenced.")
     except Exception as e:
         await update.message.reply_text(f"Failed to mute: {e}")
 
 async def nuke(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Deletes X messages."""
-    if not await is_admin(update):
-        await update.message.reply_text("❌ You cannot destroy this village.")
-        return
-
-    args = context.args
-    if not args:
+    """Deletes X messages safely."""
+    if not await is_admin(update): return
+    
+    # Validation
+    if not context.args:
         await update.message.reply_text("Usage: /nuke <number>")
         return
-
     try:
-        count = int(args[0])
-        message_id = update.message.message_id
-        chat_id = update.message.chat_id
-        
-        # Delete the command message itself first
-        await update.message.delete()
-        
-        # Batch delete is not directly supported by all clients easily, we iterate.
-        # Note: Bots cannot delete messages older than 48 hours.
-        deleted_count = 0
-        current_id = message_id - 1
-        
-        status_msg = await context.bot.send_message(chat_id, f"☢️ **Almighty Push!** Destroying {count} messages...", parse_mode=ParseMode.MARKDOWN)
-        
-        # Attempt to delete previous messages
-        for _ in range(count):
-            try:
-                await context.bot.delete_message(chat_id, current_id)
-                deleted_count += 1
-            except Exception:
-                pass # Skip if message doesn't exist or can't be deleted
-            current_id -= 1
-
-        await context.bot.edit_message_text(chat_id=chat_id, message_id=status_msg.message_id, text=f"💥 **Art is an Explosion!**\nDeleted {deleted_count} messages.")
-        
+        limit = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("Please provide a valid number.")
+        await update.message.reply_text("Enter a number.")
+        return
 
-# --- COMMANDS: GENERAL / NARUTO THEME ---
+    # Delete command message
+    try:
+        await update.message.delete()
+    except:
+        pass
+
+    chat_id = update.effective_chat.id
+    current_msg_id = update.message.message_id
+    deleted_count = 0
+
+    status_msg = await context.bot.send_message(chat_id, f"☢️ **Almighty Push!** Targeting {limit} messages...", parse_mode=ParseMode.MARKDOWN)
+
+    # Loop backwards
+    for i in range(1, limit + 1):
+        target_id = current_msg_id - i
+        if target_id == status_msg.message_id: continue # Don't delete status msg
+
+        try:
+            await context.bot.delete_message(chat_id, target_id)
+            deleted_count += 1
+            await asyncio.sleep(0.05) # Anti-flood
+        except BadRequest:
+            continue # Skip msg if too old or missing
+        except Exception as e:
+            logger.error(f"Nuke error: {e}")
+
+    # Success & Cleanup
+    final_text = f"💥 **Destruction Complete.**\nDeleted {deleted_count} messages."
+    await context.bot.edit_message_text(chat_id, status_msg.message_id, final_text, parse_mode=ParseMode.MARKDOWN)
+    
+    await asyncio.sleep(3)
+    try:
+        await context.bot.delete_message(chat_id, status_msg.message_id)
+    except:
+        pass
 
 async def shout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = ' '.join(context.args)
     if not msg:
         await update.message.reply_text("Usage: /shout <message>")
         return
-    # Shout in bold and uppercase
-    response = f"📢 **{msg.upper()}! DATTEBAYO!**"
-    await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"📢 **{msg.upper()}! DATTEBAYO!**", parse_mode=ParseMode.MARKDOWN)
 
 async def block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Blocks a user from using the bot (Soft Ban)."""
-    if not await is_admin(update):
-        return
-
+    """Soft Ban: Ignores user messages."""
+    if not await is_admin(update): return
     if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a user to block them from bot interaction.")
+        await update.message.reply_text("Reply to block user.")
         return
-
-    user_id = update.message.reply_to_message.from_user.id
-    data = load_data()
     
-    if user_id not in data["blocked"]:
-        data["blocked"].append(user_id)
+    uid = update.message.reply_to_message.from_user.id
+    data = load_data()
+    if uid not in data["blocked"]:
+        data["blocked"].append(uid)
         save_data(data)
-        await update.message.reply_text(f"🚫 User {user_id} has been blocked from using my jutsu.")
+        await update.message.reply_text(f"🚫 User {uid} is now ignored by the Akatsuki.")
     else:
         await update.message.reply_text("User is already blocked.")
 
 # --- AUTO REPLY SYSTEM ---
 
-async def add_autoreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Syntax: /autoreply trigger | response
-    if not await is_admin(update):
-        await update.message.reply_text("❌ Only the Kage can teach me new words.")
-        return
-        
+async def autoreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update): return
     text = ' '.join(context.args)
     if "|" not in text:
-        await update.message.reply_text("Usage: /autoreply trigger word | response message")
+        await update.message.reply_text("Usage: /autoreply trigger | response")
         return
-
+    
     trigger, response = text.split("|", 1)
     trigger = trigger.strip().lower()
-    response = response.strip()
-
+    
     data = load_data()
-    data["autoreply"][trigger] = response
+    data["autoreply"][trigger] = response.strip()
     save_data(data)
-
-    await update.message.reply_text(f"✅ **Jutsu Learned!**\nTrigger: `{trigger}`\nResponse: `{response}`", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"✅ Learned Jutsu: `{trigger}`", parse_mode=ParseMode.MARKDOWN)
 
 async def delete_autoreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        return
-        
+    if not await is_admin(update): return
     trigger = ' '.join(context.args).strip().lower()
     data = load_data()
     
     if trigger in data["autoreply"]:
         del data["autoreply"][trigger]
         save_data(data)
-        await update.message.reply_text(f"🗑️ Forgot jutsu: `{trigger}`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"🗑️ Forgot Jutsu: `{trigger}`", parse_mode=ParseMode.MARKDOWN)
     else:
-        await update.message.reply_text("❌ I don't know that jutsu.")
+        await update.message.reply_text("❌ Jutsu not found.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+    if not update.message or not update.message.text: return
+    
+    # 1. Check if user is blocked
+    uid = update.effective_user.id
+    data = load_data()
+    if uid in data["blocked"]:
         return
 
-    user_id = update.effective_user.id
-    data = load_data()
-
-    # Check Block
-    if user_id in data["blocked"]:
-        return # Ignore blocked users
-
-    # Auto Reply Logic
+    # 2. Check for Auto Reply
     text = update.message.text.lower()
     if text in data["autoreply"]:
         await update.message.reply_text(data["autoreply"][text])
 
-# --- MAIN EXECUTION ---
+# --- MAIN ENTRY ---
+
 def main():
     if not TOKEN:
-        print("Error: BOT_TOKEN is missing in .env")
+        print("❌ CRITICAL ERROR: BOT_TOKEN is missing in Environment Variables.")
         return
 
-    # Start the Keep Alive server (Flask)
+    # Start Flask Server
     keep_alive()
 
-    # Build the Application
+    # Init Bot
     app = Application.builder().token(TOKEN).build()
 
-    # Admin Handlers
+    # Add Handlers
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ban", ban))
     app.add_handler(CommandHandler("kick", kick))
-    app.add_handler(CommandHandler("mute", mute))
-    app.add_handler(CommandHandler("nuke", nuke))
-    app.add_handler(CommandHandler("block", block_user))
-    
-    # Auto Reply Handlers
-    app.add_handler(CommandHandler("autoreply", add_autoreply))
-    app.add_handler(CommandHandler("deleteautoreply", delete_autoreply))
-    
-    # General Handlers
-    app.add_handler(CommandHandler("shout", shout))
-    
-    # Message Handler (Must be last)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    print("Shinobi Bot is running... Dattebayo!")
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
+    app.add_handler(CommandHandler("mute"
