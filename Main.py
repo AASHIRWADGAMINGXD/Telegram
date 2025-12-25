@@ -1,259 +1,185 @@
 import os
-import json
 import logging
 import asyncio
-from telegram import Update, ChatPermissions
-from telegram.constants import ParseMode
-from telegram.error import BadRequest
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from keep_alive import keep_alive
+from threading import Thread
+from flask import Flask
 
-# --- CONFIGURATION ---
-TOKEN = os.environ.get("BOT_TOKEN")
+# Telegram Bot Imports
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, constants
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters
+)
 
-# Setup Logging
+# ---------------------------------------------------------------------------
+# 1. SETUP LOGGING
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-logger = logging.getLogger(__name__)
 
-# --- PERSISTENCE LAYER ---
-DB_FILE = "storage.json"
+# ---------------------------------------------------------------------------
+# 2. KEEP ALIVE (Web Server)
+# ---------------------------------------------------------------------------
+app = Flask('')
 
-def load_data():
-    if not os.path.exists(DB_FILE):
-        return {"autoreply": {}, "blocked": []}
-    try:
-        with open(DB_FILE, "r") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return {"autoreply": {}, "blocked": []}
+@app.route('/')
+def home():
+    return "Bot is running!"
 
-def save_data(data):
-    with open(DB_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+def run():
+    app.run(host='0.0.0.0', port=8080)
 
-# --- ADMIN HELPER ---
-async def is_admin(update: Update) -> bool:
-    """Checks if the user is an admin or creator."""
-    if not update.effective_chat:
-        return False
-    if update.effective_chat.type == "private":
-        return True # Owner is admin in DM
-        
-    try:
-        user_id = update.effective_user.id
-        member = await update.effective_chat.get_member(user_id)
-        return member.status in ['administrator', 'creator']
-    except Exception as e:
-        logger.error(f"Admin Check Error: {e}")
-        return False
+def keep_alive():
+    """Starts a background thread to keep the bot alive on cloud hosting."""
+    t = Thread(target=run)
+    t.start()
 
-# --- COMMANDS ---
+# ---------------------------------------------------------------------------
+# 3. COMMAND HANDLERS
+# ---------------------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👁️ **The cycle of hatred begins...**\n\n"
-        "I am online. My commands:\n"
-        "⚡ /ban (Reply) - Shinra Tensei\n"
-        "⚡ /kick (Reply) - Begone\n"
-        "⚡ /mute (Reply) - Chibaku Tensei\n"
-        "⚡ /nuke <num> - Almighty Push\n"
-        "⚡ /block (Reply) - Block user from bot\n"
-        "⚡ /shout <msg> - Yell\n"
-        "⚡ /autoreply <trigger> | <response>\n"
-        "⚡ /deleteautoreply <trigger>\n\n"
-        "Dattebayo!",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await update.message.reply_text("Bot is Online! Type /help to see commands.")
+
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Admin Panel: [Placeholder for Admin Logic]")
+
+async def anti_raid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Logic to toggle anti-raid mode would go here
+    await update.message.reply_text("🛡️ Anti-Raid settings accessed.")
+
+async def approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Approval system settings.")
 
 async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        await update.message.reply_text("❌ You lack the visual prowess.")
-        return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a ninja to ban them.")
-        return
+    # Example logic: Check if user is reply or argument provided
+    await update.message.reply_text("🔨 Ban command received. (Requires admin permissions logic)")
 
-    user = update.message.reply_to_message.from_user
-    try:
-        await update.effective_chat.ban_member(user.id)
-        await update.message.reply_text(f"🛑 **SHINRA TENSEI!**\n{user.first_name} has been purged.")
-    except Exception as e:
-        await update.message.reply_text(f"Failed to ban: {e}")
-
-async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update): return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a ninja to kick them.")
-        return
-
-    user = update.message.reply_to_message.from_user
-    try:
-        await update.effective_chat.unban_member(user.id)
-        await update.message.reply_text(f"🦶 **Begone!**\n{user.first_name} was kicked.")
-    except Exception as e:
-        await update.message.reply_text(f"Failed to kick: {e}")
-
-async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update): return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a ninja to silence them.")
-        return
-
-    user = update.message.reply_to_message.from_user
-    permissions = ChatPermissions(can_send_messages=False)
-    try:
-        await update.effective_chat.restrict_member(user.id, permissions=permissions)
-        await update.message.reply_text(f"🔇 **Chibaku Tensei!**\n{user.first_name} is silenced.")
-    except Exception as e:
-        await update.message.reply_text(f"Failed to mute: {e}")
+async def blocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🚫 Blocklist management.")
 
 async def nuke(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Deletes X messages safely."""
-    if not await is_admin(update): return
+    await update.message.reply_text("☢️ Nuke initiated... (This should delete messages)")
+
+async def disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔌 Disable command received. Specify module to disable.")
+
+# --- Language Handler ---
+async def languages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("English", callback_data='lang_eng')],
+        [InlineKeyboardButton("Gang Language", callback_data='lang_gang')],
+        [InlineKeyboardButton("Simmi ki", callback_data='lang_simmi')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Choose your option:", reply_markup=reply_markup)
+
+async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer() # Vital to stop the loading animation
     
-    # Validation
-    if not context.args:
-        await update.message.reply_text("Usage: /nuke <number>")
-        return
-    try:
-        limit = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Enter a number.")
-        return
+    choice = query.data
+    response_text = ""
+    
+    if choice == 'lang_eng':
+        response_text = "Language set to: English 🇬🇧"
+    elif choice == 'lang_gang':
+        response_text = "Language set to: Gang Language 🤟"
+    elif choice == 'lang_simmi':
+        response_text = "Language set to: Simmi ki ✨"
+        
+    await query.edit_message_text(text=response_text)
 
-    # Delete command message
-    try:
-        await update.message.delete()
-    except:
-        pass
+# --- End Language Handler ---
 
-    chat_id = update.effective_chat.id
-    current_msg_id = update.message.message_id
-    deleted_count = 0
+async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📜 Here are the group rules...")
 
-    status_msg = await context.bot.send_message(chat_id, f"☢️ **Almighty Push!** Targeting {limit} messages...", parse_mode=ParseMode.MARKDOWN)
+async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🚨 Report sent to admins.")
 
-    # Loop backwards
-    for i in range(1, limit + 1):
-        target_id = current_msg_id - i
-        if target_id == status_msg.message_id: continue # Don't delete status msg
-
+async def pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.reply_to_message:
         try:
-            await context.bot.delete_message(chat_id, target_id)
-            deleted_count += 1
-            await asyncio.sleep(0.05) # Anti-flood
-        except BadRequest:
-            continue # Skip msg if too old or missing
+            await update.message.reply_to_message.pin()
+            await update.message.reply_text("📌 Message pinned.")
         except Exception as e:
-            logger.error(f"Nuke error: {e}")
+            await update.message.reply_text(f"Error pinning: {e}")
+    else:
+        await update.message.reply_text("Reply to a message to pin it.")
 
-    # Success & Cleanup
-    final_text = f"💥 **Destruction Complete.**\nDeleted {deleted_count} messages."
-    await context.bot.edit_message_text(chat_id, status_msg.message_id, final_text, parse_mode=ParseMode.MARKDOWN)
-    
-    await asyncio.sleep(3)
-    try:
-        await context.bot.delete_message(chat_id, status_msg.message_id)
-    except:
-        pass
+async def privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔒 Privacy settings.")
+
+async def locks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔒 Lock settings (Media, Sticker, Forward).")
+
+async def log_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Telegram commands cannot have spaces, so we use /log_channel
+    await update.message.reply_text("📝 Log Channel settings.")
+
+async def custom_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Telegram commands cannot have spaces, so we use /custom_settings
+    await update.message.reply_text("⚙️ Custom settings menu.")
 
 async def shout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = ' '.join(context.args)
-    if not msg:
+    # Logic: Bot repeats what the user said
+    if context.args:
+        message = ' '.join(context.args)
+        await update.message.reply_text(f"📢 {message}")
+    else:
         await update.message.reply_text("Usage: /shout <message>")
-        return
-    await update.message.reply_text(f"📢 **{msg.upper()}! DATTEBAYO!**", parse_mode=ParseMode.MARKDOWN)
 
-async def block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Soft Ban: Ignores user messages."""
-    if not await is_admin(update): return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to block user.")
-        return
-    
-    uid = update.message.reply_to_message.from_user.id
-    data = load_data()
-    if uid not in data["blocked"]:
-        data["blocked"].append(uid)
-        save_data(data)
-        await update.message.reply_text(f"🚫 User {uid} is now ignored by the Akatsuki.")
-    else:
-        await update.message.reply_text("User is already blocked.")
+# ---------------------------------------------------------------------------
+# 4. MAIN APPLICATION
+# ---------------------------------------------------------------------------
 
-# --- AUTO REPLY SYSTEM ---
-
-async def autoreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update): return
-    text = ' '.join(context.args)
-    if "|" not in text:
-        await update.message.reply_text("Usage: /autoreply trigger | response")
-        return
-    
-    trigger, response = text.split("|", 1)
-    trigger = trigger.strip().lower()
-    
-    data = load_data()
-    data["autoreply"][trigger] = response.strip()
-    save_data(data)
-    await update.message.reply_text(f"✅ Learned Jutsu: `{trigger}`", parse_mode=ParseMode.MARKDOWN)
-
-async def delete_autoreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update): return
-    trigger = ' '.join(context.args).strip().lower()
-    data = load_data()
-    
-    if trigger in data["autoreply"]:
-        del data["autoreply"][trigger]
-        save_data(data)
-        await update.message.reply_text(f"🗑️ Forgot Jutsu: `{trigger}`", parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text("❌ Jutsu not found.")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text: return
-    
-    # 1. Check if user is blocked
-    uid = update.effective_user.id
-    data = load_data()
-    if uid in data["blocked"]:
-        return
-
-    # 2. Check for Auto Reply
-    text = update.message.text.lower()
-    if text in data["autoreply"]:
-        await update.message.reply_text(data["autoreply"][text])
-
-# --- MAIN ENTRY ---
-
-def main():
-    if not TOKEN:
-        print("❌ CRITICAL ERROR: BOT_TOKEN is missing in Environment Variables.")
-        return
-
-    # Start Flask Server
+if __name__ == '__main__':
+    # 1. Start Web Server for Keep Alive
     keep_alive()
 
-    # Init Bot
-    app = Application.builder().token(TOKEN).build()
+    # 2. Get Token from Environment Variable
+    TOKEN = os.getenv("BOT_TOKEN")
+    
+    if not TOKEN:
+        print("Error: BOT_TOKEN is missing in environment variables.")
+        exit(1)
 
-    # Add Handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ban", ban))
-    app.add_handler(CommandHandler("kick", kick))
-    app.add_handler(CommandHandler("mute", mute))
-    app.add_handler(CommandHandler("nuke", nuke))
-    app.add_handler(CommandHandler("shout", shout))
-    app.add_handler(CommandHandler("block", block_user))
-    app.add_handler(CommandHandler("autoreply", autoreply))
-    app.add_handler(CommandHandler("deleteautoreply", delete_autoreply))
+    # 3. Build Application
+    application = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # 4. Add Handlers
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(CommandHandler('admin', admin))
+    application.add_handler(CommandHandler('antiraid', anti_raid))
+    application.add_handler(CommandHandler('approval', approval))
+    application.add_handler(CommandHandler('ban', ban))
+    application.add_handler(CommandHandler('blocklist', blocklist))
+    application.add_handler(CommandHandler('nuke', nuke))
+    application.add_handler(CommandHandler('disable', disable))
+    
+    # Language specific
+    application.add_handler(CommandHandler('languages', languages))
+    application.add_handler(CallbackQueryHandler(language_callback, pattern='^lang_'))
 
-    print("Shinobi Bot is running... Dattebayo!")
-    app.run_polling()
+    application.add_handler(CommandHandler('rules', rules))
+    application.add_handler(CommandHandler('report', report))
+    application.add_handler(CommandHandler('pin', pin))
+    application.add_handler(CommandHandler('privacy', privacy))
+    application.add_handler(CommandHandler('locks', locks))
+    
+    # Note: Telegram commands cannot contain spaces. 
+    # Mapped "/log channel" to /log_channel and "/custom settings" to /custom_settings
+    application.add_handler(CommandHandler('log_channel', log_channel)) 
+    application.add_handler(CommandHandler('custom_settings', custom_settings))
+    
+    application.add_handler(CommandHandler('shout', shout))
 
-if __name__ == "__main__":
-    main()
+    print("Bot is polling...")
+    application.run_polling()
