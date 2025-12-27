@@ -2,8 +2,8 @@ import os
 import logging
 import asyncio
 from dotenv import load_dotenv
-# FIX: Added 'Object' to imports here
-from telegram import Update, ChatPermissions, Object 
+# FIX 1: Removed 'Object' from imports
+from telegram import Update, ChatPermissions
 from telegram.ext import (
     ApplicationBuilder, 
     ContextTypes, 
@@ -175,10 +175,10 @@ async def watcher_autoreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "admin" in msg: await update.message.reply_text("👨‍💻 Admins are busy.")
     elif "rules" in msg: await update.message.reply_text("📜 Check pinned messages.")
 
-# --- ⚠️ ERROR HANDLER (This caused your error) ---
+# --- ⚠️ ERROR HANDLER ---
 
-# FIX: Ensure 'Object' is imported at the top of the file
-async def error_handler(update: Object, context: ContextTypes.DEFAULT_TYPE):
+# FIX 2: Changed 'Object' to 'object' (lowercase)
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Log the error and send a telegram message to notify the developer."""
     logger.error("Exception while handling an update:", exc_info=context.error)
 
