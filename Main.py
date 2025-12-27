@@ -2,7 +2,6 @@ import os
 import logging
 import asyncio
 from dotenv import load_dotenv
-# FIX 1: Removed 'Object' from imports
 from telegram import Update, ChatPermissions
 from telegram.ext import (
     ApplicationBuilder, 
@@ -177,7 +176,6 @@ async def watcher_autoreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- ⚠️ ERROR HANDLER ---
 
-# FIX 2: Changed 'Object' to 'object' (lowercase)
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Log the error and send a telegram message to notify the developer."""
     logger.error("Exception while handling an update:", exc_info=context.error)
