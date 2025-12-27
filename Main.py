@@ -1,239 +1,278 @@
 import os
-import json
 import logging
 import asyncio
-from functools import wraps
 from dotenv import load_dotenv
 from telegram import Update, ChatPermissions
 from telegram.ext import (
-    ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+    ApplicationBuilder, 
+    ContextTypes, 
+    CommandHandler, 
+    MessageHandler, 
+    filters
 )
 from keep_alive import keep_alive
 
-# --- CONFIGURATION ---
+# 1. LOAD ENVIRONMENT
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_PASSWORD = "bala"
-DB_FILE = "database.json"
 
-# --- LOGGING SETUP ---
+if not TOKEN:
+    print("❌ Error: BOT_TOKEN not found in .env file.")
+    exit(1)
+
+# 2. LOGGING CONFIG
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-logger = logging.getLogger(__name__)
 
-# --- DATABASE MANAGEMENT ---
-def load_db():
-    if not os.path.exists(DB_FILE):
-        return {"authorized_users": [], "settings": {}, "rules": "The world shall know pain."}
-    with open(DB_FILE, "r") as f:
-        return json.load(f)
+# 3. MEMORY STORAGE
+# Stores Anti-Raid status per chat: { chat_id: True/False }
+anti_raid_status = {} 
 
-def save_db(data):
-    with open(DB_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+# --- 🧠 THE BOT BRAIN (Safety & Helper Functions) ---
 
-db = load_db()
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """Checks if a specific user ID is an admin in the chat."""
+    try:
+        member = await context.bot.get_chat_member(update.effective_chat.id, user_id)
+        return member.status in ['administrator', 'creator']
+    except:
+        return False
 
-# --- AUTH DECORATOR ---
-def restricted(func):
-    """Decorator to restrict usage to logged-in users only."""
-    @wraps(func)
-    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        user_id = update.effective_user.id
-        if user_id not in db["authorized_users"]:
-            await update.message.reply_text(
-                "🛑 **ACCESS DENIED**\n\n"
-                "You are not authorized to command the Leader of the Akatsuki.\n"
-                "Use `/login <password>` to prove your worth."
-            )
-            return
-        return await func(update, context, *args, **kwargs)
-    return wrapped
+async def check_authority(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    1. Checks if the command sender is Admin.
+    2. Sends a rejection message if not.
+    """
+    user_id = update.effective_user.id
+    if not await is_admin(update, context, user_id):
+        await update.message.reply_text("⛔ **Access Denied:** Administrators only.")
+        return False
+    return True
 
-# --- COMMAND HANDLERS ---
+async def get_target(update: Update):
+    """Safely gets the user replying to."""
+    if not update.message.reply_to_message:
+        await update.message.reply_text("⚠️ Reply to a user's message to perform this action.")
+        return None
+    return update.message.reply_to_message.from_user
+
+async def safety_check(update: Update, context: ContextTypes.DEFAULT_TYPE, target_user) -> bool:
+    """
+    THE BRAIN: 
+    - Prevents bot from targeting itself.
+    - Prevents bot from targeting other admins.
+    """
+    # 1. Don't attack self
+    if target_user.id == context.bot.id:
+        await update.message.reply_text("🤖 **System Protocol:** I cannot ban or mute myself.")
+        return False
+    
+    # 2. Don't attack admins
+    if await is_admin(update, context, target_user.id):
+        await update.message.reply_text(f"🛡️ **Security:** I cannot punish Admin {target_user.first_name}.")
+        return False
+        
+    return True
+
+# --- 🛠️ FEATURE COMMANDS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "I am Nagato. Pain.\n\n"
-        "To utilize my power, you must first authenticate.\n"
-        "Use `/login <password>`."
+        "👋 **Professional Manager Bot Online**\n\n"
+        "**Commands:**\n"
+        "• /antiraid - Toggle Raid Protection\n"
+        "• /shout <msg> - Pin & Notify\n"
+        "• /clear - Delete replied message\n"
+        "• /pin & /unpin\n"
+        "• /kick, /mute, /ban\n"
+        "• /banchannel - Permaban from channel"
     )
 
-async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in db["authorized_users"]:
-        await update.message.reply_text("You are already recognized by the Akatsuki.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("Usage: `/login <password>`")
-        return
-
-    password = context.args[0]
-    if password == ADMIN_PASSWORD:
-        db["authorized_users"].append(user_id)
-        save_db(db)
-        await update.message.reply_text(
-            "✅ **Access Granted.**\n\n"
-            "Welcome to the Akatsuki. My power is now yours to command.\n"
-            "Type `/help` to see the jutsu list."
-        )
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_authority(update, context): return
+    
+    # If replied to a message, delete that message and the command
+    if update.message.reply_to_message:
+        try:
+            await update.message.reply_to_message.delete()
+            await update.message.delete()
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {e}")
     else:
-        await update.message.reply_text("❌ **Incorrect.** Do not trifle with a God.")
+        await update.message.reply_text("Usage: Reply to the message you want to /clear.")
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    commands = (
-        "/admin - Toggle admin mode\n"
-        "/antiRaid - Activate defense systems\n"
-        "/approval - Approve new members\n"
-        "/ban - Ban a user (Shinra Tensei)\n"
-        "/blocklist - Manage blocked words\n"
-        "/nuke - Destroy chat history\n"
-        "/disable - Disable features\n"
-        "/rules - View rules\n"
-        "/report - Report an issue\n"
-        "/pin - Pin a message\n"
-        "/privacy - View privacy settings\n"
-        "/locks - Lock chat permissions\n"
-        "/log_channel - Set logging channel\n"
-        "/custom_settings - Edit bot behavior\n"
-        "/shout - Broadcast message"
-    )
-    await update.message.reply_text(f"**Available Jutsu:**\n\n{commands}")
+async def cmd_shout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_authority(update, context): return
+    
+    args = context.args
+    if not args:
+        return await update.message.reply_text("Usage: `/shout <message>`", parse_mode='Markdown')
+    
+    text = " ".join(args).upper()
+    try:
+        # Send message
+        msg = await update.message.reply_text(f"📢 **ANNOUNCEMENT**\n\n{text}", parse_mode='Markdown')
+        # Pin with notification
+        await msg.pin(disable_notification=False)
+    except Exception as e:
+        await update.message.reply_text("⚠️ Could not pin. Check my admin permissions.")
 
-# --- FEATURE COMMANDS ---
-
-@restricted
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Admin privileges acknowledged. I am listening.")
-
-@restricted
-async def anti_raid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status = "ACTIVE"
-    await update.message.reply_text(f"🛡 **Anti-Raid System: {status}**\n\nNo intruders shall pass.")
-
-@restricted
-async def approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("User approval mode is set to Manual. You decide their fate.")
-
-@restricted
-async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a user to ban them.")
-        return
+async def cmd_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_authority(update, context): return
+    if not update.message.reply_to_message: return await update.message.reply_text("Reply to a message to pin.")
     
     try:
-        user_to_ban = update.message.reply_to_message.from_user
-        await context.bot.ban_chat_member(chat_id=update.effective_chat.id, user_id=user_to_ban.id)
-        await update.message.reply_text(f"**SHINRA TENSEI!**\n\n{user_to_ban.first_name} has been removed from this world.")
-    except Exception as e:
-        await update.message.reply_text(f"Failed to ban. My chakra is limited here: {e}")
-
-@restricted
-async def blocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Blocklist updated. Filthy words shall not be spoken here.")
-
-@restricted
-async def nuke(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⚠️ **CHAOTIC SHINRA TENSEI**\n\n(Simulation: In a real nuke, I would delete all recent messages here.)")
-
-@restricted
-async def disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Feature disabled. The path is closed.")
-
-@restricted
-async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rules_text = db.get("rules", "No rules set.")
-    await update.message.reply_text(f"📜 **The Laws of Pain:**\n\n{rules_text}")
-
-@restricted
-async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Your report has been heard. Justice will be served.")
-
-@restricted
-async def pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.reply_to_message:
         await update.message.reply_to_message.pin()
-        await update.message.reply_text("📌 This message is now absolute.")
-    else:
-        await update.message.reply_text("Reply to a message to pin it.")
+        await update.message.reply_text("📌 **Pinned.**")
+    except:
+        await update.message.reply_text("❌ Failed to pin.")
 
-@restricted
-async def privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Privacy Policy: We see everything. We know everything.")
+async def cmd_unpin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_authority(update, context): return
+    if not update.message.reply_to_message: return await update.message.reply_text("Reply to a message to unpin.")
+    
+    try:
+        await update.message.reply_to_message.unpin()
+        await update.message.reply_text("Message unpinned.")
+    except:
+        await update.message.reply_text("❌ Failed to unpin.")
 
-@restricted
-async def locks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Lock common permissions
-    permissions = ChatPermissions(can_send_messages=False)
-    await context.bot.set_chat_permissions(update.effective_chat.id, permissions)
-    await update.message.reply_text("🔒 **Planetary Devastation.** Chat has been locked.")
+# --- ⚖️ MODERATION TOOLS ---
 
-@restricted
-async def log_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_authority(update, context): return
+    target = await get_target(update)
+    if not target: return
+    
+    # Run Safety Checks (Brain)
+    if not await safety_check(update, context, target): return
+
+    try:
+        await context.bot.ban_chat_member(update.effective_chat.id, target.id)
+        await context.bot.unban_chat_member(update.effective_chat.id, target.id) # Unban immediately allows rejoin
+        await update.message.reply_text(f"👢 **{target.first_name}** was kicked.")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Logic for /ban and /banchannel (Same function in Telegram API)"""
+    if not await check_authority(update, context): return
+    target = await get_target(update)
+    if not target: return
+    
+    if not await safety_check(update, context, target): return
+
+    try:
+        # Ban permanently (User cannot open channel/group via link)
+        await context.bot.ban_chat_member(update.effective_chat.id, target.id)
+        await update.message.reply_text(f"⛔ **{target.first_name}** has been banned permanently.")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_authority(update, context): return
+    target = await get_target(update)
+    if not target: return
+    
+    if not await safety_check(update, context, target): return
+
+    try:
+        # Restrict permissions to False
+        permissions = ChatPermissions(can_send_messages=False)
+        await context.bot.restrict_chat_member(update.effective_chat.id, target.id, permissions=permissions)
+        await update.message.reply_text(f"🔇 **{target.first_name}** is now muted.")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+# --- 🛡️ ANTI RAID & AUTO REPLY ---
+
+async def cmd_antiraid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_authority(update, context): return
+    
     chat_id = update.effective_chat.id
-    db["settings"]["log_channel"] = chat_id
-    save_db(db)
-    await update.message.reply_text(f"This channel ({chat_id}) is now the eyes of the Akatsuki.")
+    current_status = anti_raid_status.get(chat_id, False)
+    
+    # Toggle Status
+    anti_raid_status[chat_id] = not current_status
+    
+    if not current_status:
+        await update.message.reply_text(f"🚨 **ANTI-RAID ENABLED**\nBot is now watching `{update.effective_chat.title}`. Any new user joining will be kicked immediately.")
+    else:
+        await update.message.reply_text(f"✅ **Anti-Raid Disabled**\nNormal entry allowed.")
 
-@restricted
-async def custom_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Custom settings panel opened (Simulation).")
+async def watcher_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Passive watcher.
+    1. Checks if Anti-Raid is ON for this specific chat.
+    2. If ON, kicks new members.
+    """
+    chat_id = update.effective_chat.id
+    
+    # Check if Anti-Raid is active in this specific group
+    if anti_raid_status.get(chat_id, False):
+        for member in update.message.new_chat_members:
+            # Don't kick the bot
+            if member.id == context.bot.id: continue
+            
+            try:
+                await context.bot.ban_chat_member(chat_id, member.id)
+                await context.bot.unban_chat_member(chat_id, member.id)
+                await update.message.reply_text(f"🛡️ **Raid Protection:** Removed {member.first_name}")
+            except:
+                pass
 
-@restricted
-async def shout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Give me words to shout.")
-        return
-    msg = " ".join(context.args).upper()
-    await update.message.reply_text(f"📢 **{msg}**")
+async def watcher_autoreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Passive text listener for auto-replies."""
+    if not update.message or not update.message.text: return
+    
+    msg_text = update.message.text.lower()
+    
+    # Dictionary of triggers
+    triggers = {
+        "price": "💰 Check pinned message for prices!",
+        "admin": "👨‍💻 Admins are currently busy, please wait.",
+        "support": "📩 Contact @Owner for support.",
+        "rules": "📜 Read the rules before chatting."
+    }
+    
+    for word, response in triggers.items():
+        if word in msg_text:
+            await update.message.reply_text(response)
+            break
 
-# --- ERROR HANDLING ---
-async def error_handler(update: Object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Update {update} caused error {context.error}")
-    # Only send message if possible
-    if isinstance(update, Update) and update.message:
-         await update.message.reply_text("My vision is blurred... An internal error occurred.")
+# --- 🚀 RUNNER ---
 
-# --- MAIN EXECUTION ---
 if __name__ == '__main__':
-    # Start Keep Alive
+    # 1. Start Web Server
     keep_alive()
     
-    # Check Token
-    if not TOKEN:
-        print("Error: BOT_TOKEN not found in .env")
-        exit(1)
+    # 2. Build Bot
+    print("🔥 System Starting...")
+    application = ApplicationBuilder().token(TOKEN).build()
+    
+    # 3. Add Command Handlers
+    application.add_handler(CommandHandler("start", start))
+    
+    # Feature Handlers
+    application.add_handler(CommandHandler("clear", cmd_clear))
+    application.add_handler(CommandHandler("shout", cmd_shout))
+    application.add_handler(CommandHandler("pin", cmd_pin))
+    application.add_handler(CommandHandler("unpin", cmd_unpin))
+    
+    # Moderation Handlers
+    application.add_handler(CommandHandler("kick", cmd_kick))
+    application.add_handler(CommandHandler("mute", cmd_mute))
+    application.add_handler(CommandHandler("ban", cmd_ban))
+    application.add_handler(CommandHandler("banchannel", cmd_ban)) # Alias
+    
+    # Security Handlers
+    application.add_handler(CommandHandler("antiraid", cmd_antiraid))
+    
+    # Passive Watchers (Grouped to run alongside commands if needed)
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, watcher_new_members))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), watcher_autoreply))
 
-    # Build Application
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    # Public Handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("login", login))
-    app.add_handler(CommandHandler("help", help_command))
-
-    # Restricted Handlers
-    app.add_handler(CommandHandler("admin", admin))
-    app.add_handler(CommandHandler("antiraid", anti_raid))
-    app.add_handler(CommandHandler("approval", approval))
-    app.add_handler(CommandHandler("ban", ban))
-    app.add_handler(CommandHandler("blocklist", blocklist))
-    app.add_handler(CommandHandler("nuke", nuke))
-    app.add_handler(CommandHandler("disable", disable))
-    app.add_handler(CommandHandler("rules", rules))
-    app.add_handler(CommandHandler("report", report))
-    app.add_handler(CommandHandler("pin", pin))
-    app.add_handler(CommandHandler("privacy", privacy))
-    app.add_handler(CommandHandler("locks", locks))
-    app.add_handler(CommandHandler("log_channel", log_channel))
-    app.add_handler(CommandHandler("custom_settings", custom_settings))
-    app.add_handler(CommandHandler("shout", shout))
-
-    # Error Handler
-    app.add_error_handler(error_handler)
-
-    print("Nagato is awake. The world shall know pain...")
-    app.run_polling()
+    print("✅ Bot is Live and Polling.")
+    application.run_polling()
