@@ -1,3 +1,4 @@
 python-telegram-bot>=21.9
-flask
+Flask
+requests
 python-dotenv
