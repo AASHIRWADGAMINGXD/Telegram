@@ -105,7 +105,6 @@ class DataManager:
     def check_gban(self, user_id):
         return user_id in self.data["gban_list"]
 
-    # Store Messages (Shortener/Special Link)
     def store_msg(self, text):
         uid = str(uuid.uuid4())[:8]
         if "stored_msgs" not in self.data:
@@ -143,7 +142,7 @@ def admin_only(func):
             except: pass
     return wrapper
 
-# ================= 🆕 UPDATED COMMANDS =================
+# ================= 🆕 START & NEW FEATURES =================
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles /start and Deep Links"""
@@ -163,9 +162,8 @@ async def genlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/genlink - Generate TinyURL Invite"""
     chat = update.effective_chat
     try:
-        # 1. Create Telegram Invite
         link = await chat.create_invite_link(member_limit=1)
-        # 2. Shorten with TinyURL
+        # Using TinyURL API
         api = f"http://tinyurl.com/api-create.php?url={link.invite_link}"
         short = requests.get(api).text
         await update.message.reply_text(f"🔗 **Shortened Invite:**\n{short}")
@@ -174,7 +172,6 @@ async def genlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def shortener_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/shortner <text> - Stores text and gives link"""
-    # Updated as per user request: "it’s store the message"
     if not context.args:
         return await update.message.reply_text("Usage: /shortner <your message>")
     
@@ -197,7 +194,6 @@ async def special_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Check arguments
     if context.args:
-        # Grab everything after command
         user_input = update.message.text.split(" ", 1)[1]
         text += f"📝 **Note:**\n{user_input}"
     
@@ -208,73 +204,16 @@ async def special_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_url = f"https://t.me/{context.bot.username}?start={uid}"
     await update.message.reply_text(f"🔐 **Multi-Message Stored!**\n\n🔗 Secret Link:\n{bot_url}")
 
-@admin_only
-async def purge(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/purge - Fixed Batch Delete"""
-    if not update.message.reply_to_message:
-        return await update.message.reply_text("Reply to a message to start purging.")
-    
-    msg_id = update.message.reply_to_message.message_id
-    current_id = update.message.message_id
-    
-    # Create list of IDs
-    ids_to_delete = list(range(msg_id, current_id + 1))
-    
-    # Telegram Bulk Delete (Limit 100)
-    # We slice to ensure we don't exceed limits
-    chunks = [ids_to_delete[i:i + 100] for i in range(0, len(ids_to_delete), 100)]
-    
-    deleted_count = 0
-    for chunk in chunks:
-        try:
-            await update.effective_chat.delete_messages(message_ids=chunk)
-            deleted_count += len(chunk)
-        except Exception as e:
-            # Fallback for older messages or errors
-            pass
-
-    msg = await update.message.reply_text(f"🗑 **Purged {deleted_count} messages.**")
-    await asyncio.sleep(3)
-    try: await msg.delete()
-    except: pass
-
-@admin_only
-async def antilink(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/antilink on/off - Fixed"""
-    if not context.args: 
-        status = db.get_chat(update.effective_chat.id)["settings"]["antilink"]
-        return await update.message.reply_text(f"🔗 Antilink is currently: **{status}**")
-    
-    val = context.args[0].lower() == "on"
-    db.update_setting(update.effective_chat.id, "antilink", val)
-    await update.message.reply_text(f"🔗 Antilink set to: **{val}**")
-
-@admin_only
-async def filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/filter <word> <reply> - Fixed"""
-    # Use split to preserve newlines in reply
-    try:
-        args = update.message.text.split(None, 2) # /filter, word, rest
-        if len(args) < 3:
-            return await update.message.reply_text("Usage: /filter <word> <reply>")
-        
-        trigger = args[1]
-        reply = args[2]
-        
-        db.add_filter(update.effective_chat.id, trigger, reply)
-        await update.message.reply_text(f"✅ Filter saved for: `{trigger}`")
-    except Exception as e:
-        await update.message.reply_text("Error saving filter.")
-
 # ================= 🔗 LINK APPROVAL SYSTEM =================
 @admin_only
 async def create_approval_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/link Name Limit"""
     if len(context.args) < 1: return await update.message.reply_text("Usage: /link <Name> <Limit>")
     name = context.args[0]
     limit = int(context.args[1]) if len(context.args) > 1 and context.args[1].isdigit() else None
     try:
         link = await update.effective_chat.create_invite_link(name=name, member_limit=limit, creates_join_request=True)
-        await update.message.reply_text(f"🛡 **Link:** {link.invite_link}\n(Requires Approval)")
+        await update.message.reply_text(f"🛡 **Link Created:**\n{link.invite_link}\n(Requires Approval)")
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
@@ -282,7 +221,9 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     req = update.chat_join_request
     user = req.from_user
     chat = req.chat
-    text = f"👤 **Join Request**\nUser: {user.full_name}\nChat: {chat.title}"
+    
+    # Message to Group
+    text = f"Hey {user.full_name} (@{user.username}) Is Requesting to Join\nChat: {chat.title}"
     kb = [[InlineKeyboardButton("✅ Yes", callback_data=f"j_y_{user.id}"), InlineKeyboardButton("❌ No", callback_data=f"j_n_{user.id}")]]
     await context.bot.send_message(chat.id, text, reply_markup=InlineKeyboardMarkup(kb))
 
@@ -291,7 +232,7 @@ async def join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update): return await q.answer("Admin only", show_alert=True)
     
     data = q.data.split("_")
-    action = data[1]
+    action = data[1] # y or n
     uid = int(data[2])
     
     if action == "y":
@@ -303,48 +244,117 @@ async def join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await update.effective_chat.decline_join_request(uid)
             await q.edit_message_text(f"🚫 Rejected User {uid}")
-            try: await context.bot.send_message(uid, "Sorry, your join request was rejected.")
+            # DM Logic
+            try: await context.bot.send_message(uid, f"Sorry {q.from_user.first_name}, you can't join. Rejected by Owner/Admin.")
             except: pass
         except: await q.edit_message_text("Error.")
 
-# ================= 🚀 MAIN HANDLER =================
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text: return
-    
-    chat_id = update.effective_chat.id
-    text = update.message.text
-    chat_data = db.get_chat(chat_id)
-    is_adm = await is_admin(update)
+# ================= 🛡️ OLD COMMANDS (RESTORED) =================
 
-    # 1. Antilink (Improved Regex)
-    if chat_data["settings"]["antilink"] and not is_adm:
-        # Matches http, https, www., t.me, telegram.me
-        link_regex = r"(https?://|www\.|t\.me|telegram\.me)[a-zA-Z0-9_./-]+"
-        if re.search(link_regex, text, re.IGNORECASE):
-            try:
-                await update.message.delete()
-                # Optional: Warn user
-                # await update.message.reply_text("❌ No links allowed!") 
-            except: pass
-            return
+@admin_only
+async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message: return
+    try:
+        await update.effective_chat.ban_member(update.message.reply_to_message.from_user.id)
+        await update.message.reply_text("🔨 Banned.")
+    except Exception as e: await update.message.reply_text(f"Error: {e}")
 
-    # 2. Filters (Case Insensitive)
-    text_lower = text.lower()
-    if text_lower in chat_data["filters"]:
-        await update.message.reply_text(chat_data["filters"][text_lower])
+@admin_only
+async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = context.args[0] if context.args else (update.message.reply_to_message.from_user.id if update.message.reply_to_message else None)
+    if not uid: return
+    try:
+        await update.effective_chat.unban_member(uid)
+        await update.message.reply_text("✅ Unbanned.")
+    except: pass
 
-async def welcome_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_data = db.get_chat(update.effective_chat.id)
-    if chat_data["settings"]["welcome"]:
-        for m in update.message.new_chat_members:
-            if db.check_gban(m.id):
-                await update.effective_chat.ban_member(m.id)
-            else:
-                await update.message.reply_text(chat_data["text"]["welcome"].format(name=m.first_name, chat=update.effective_chat.title))
+@admin_only
+async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message: return
+    try:
+        await update.effective_chat.restrict_member(update.message.reply_to_message.from_user.id, permissions=ChatPermissions(can_send_messages=False))
+        await update.message.reply_text("🔇 Muted.")
+    except: pass
+
+@admin_only
+async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message: return
+    try:
+        await update.effective_chat.restrict_member(update.message.reply_to_message.from_user.id, permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True))
+        await update.message.reply_text("🔊 Unmuted.")
+    except: pass
+
+@admin_only
+async def lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args: return
+    arg = context.args[0].lower()
+    c = db.get_chat(update.effective_chat.id)
+    if arg not in c["locked"]:
+        c["locked"].append(arg)
+        db.save()
+    if arg == "all":
+        await update.effective_chat.set_permissions(ChatPermissions(can_send_messages=False))
+    await update.message.reply_text(f"🔒 Locked: **{arg}**", parse_mode=ParseMode.MARKDOWN)
+
+@admin_only
+async def unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args: return
+    arg = context.args[0].lower()
+    c = db.get_chat(update.effective_chat.id)
+    if arg in c["locked"]:
+        c["locked"].remove(arg)
+        db.save()
+    if arg == "all":
+        await update.effective_chat.set_permissions(ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True))
+    await update.message.reply_text(f"🔓 Unlocked: **{arg}**", parse_mode=ParseMode.MARKDOWN)
+
+@admin_only
+async def purge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/purge - Fixed Batch Delete"""
+    if not update.message.reply_to_message: return await update.message.reply_text("Reply to start.")
+    msg_id = update.message.reply_to_message.message_id
+    current_id = update.message.message_id
+    ids = list(range(msg_id, current_id + 1))
+    # Chunking 100
+    for i in range(0, len(ids), 100):
+        try: await update.effective_chat.delete_messages(ids[i:i+100])
+        except: pass
+    msg = await update.message.reply_text("🗑 Purged.")
+    await asyncio.sleep(2)
+    try: await msg.delete()
+    except: pass
+
+@admin_only
+async def antilink(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/antilink on/off - Fixed"""
+    if not context.args: return
+    val = context.args[0].lower() == "on"
+    db.update_setting(update.effective_chat.id, "antilink", val)
+    await update.message.reply_text(f"🔗 Antilink set to: **{val}**")
+
+@admin_only
+async def filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/filter <word> <reply> - Fixed"""
+    try:
+        args = update.message.text.split(None, 2)
+        if len(args) < 3: return await update.message.reply_text("Usage: /filter <word> <reply>")
+        db.add_filter(update.effective_chat.id, args[1], args[2])
+        await update.message.reply_text(f"✅ Filter saved: `{args[1]}`")
+    except: pass
+
+@admin_only
+async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args: return
+    db.set_text(update.effective_chat.id, "welcome", " ".join(context.args))
+    await update.message.reply_text("✅ Welcome message saved.")
+
+async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.message.reply_to_message.from_user if update.message.reply_to_message else update.effective_user
+    await update.message.reply_text(f"👤 **User Info**\nID: `{u.id}`\nName: {u.full_name}", parse_mode=ParseMode.MARKDOWN)
 
 @admin_only
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: return await update.message.reply_text("Usage: /broadcast <msg>")
+    if not context.args: return
     msg = " ".join(context.args)
     count = 0
     for cid in db.data["chats"]:
@@ -353,6 +363,38 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             count += 1
         except: pass
     await update.message.reply_text(f"Sent to {count} chats.")
+
+# ================= 🚀 MAIN HANDLER =================
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text: return
+    chat_id = update.effective_chat.id
+    text = update.message.text
+    chat_data = db.get_chat(chat_id)
+    is_adm = await is_admin(update)
+
+    # 1. Antilink (Fixed)
+    if chat_data["settings"]["antilink"] and not is_adm:
+        if re.search(r"(https?://|www\.|t\.me|telegram\.me)[a-zA-Z0-9_./-]+", text, re.IGNORECASE):
+            try: await update.message.delete()
+            except: pass
+            return
+
+    # 2. Locks
+    if not is_adm and "text" in chat_data["locked"]:
+        await update.message.delete()
+        return
+
+    # 3. Filters
+    text_lower = text.lower()
+    if text_lower in chat_data["filters"]:
+        await update.message.reply_text(chat_data["filters"][text_lower])
+
+async def welcome_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_data = db.get_chat(update.effective_chat.id)
+    if chat_data["settings"]["welcome"]:
+        for m in update.message.new_chat_members:
+            if db.check_gban(m.id): await update.effective_chat.ban_member(m.id)
+            else: await update.message.reply_text(chat_data["text"]["welcome"].format(name=m.first_name, chat=update.effective_chat.title))
 
 # ================= 🚀 START =================
 def main():
@@ -364,16 +406,23 @@ def main():
     # Commands
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("genlink", genlink))
-    app.add_handler(CommandHandler("shortner", shortener_cmd)) # Renamed func
+    app.add_handler(CommandHandler("shortner", shortener_cmd)) 
     app.add_handler(CommandHandler("special_link", special_link))
-    app.add_handler(CommandHandler("purge", purge))
-    app.add_handler(CommandHandler("antilink", antilink))
-    app.add_handler(CommandHandler("filter", filter_cmd))
     app.add_handler(CommandHandler("link", create_approval_link))
     app.add_handler(CommandHandler("broadcast", broadcast))
 
-    # Old Admin
-    app.add_handler(CommandHandler("ban", lambda u,c: u.message.reply_text("Use /ban <reply>"))) # Placeholder for brevity, add full if needed
+    # RESTORED Old Admin
+    app.add_handler(CommandHandler("ban", ban))
+    app.add_handler(CommandHandler("unban", unban))
+    app.add_handler(CommandHandler("mute", mute))
+    app.add_handler(CommandHandler("unmute", unmute))
+    app.add_handler(CommandHandler("purge", purge))
+    app.add_handler(CommandHandler("lock", lock))
+    app.add_handler(CommandHandler("unlock", unlock))
+    app.add_handler(CommandHandler("antilink", antilink))
+    app.add_handler(CommandHandler("filter", filter_cmd))
+    app.add_handler(CommandHandler("setwelcome", set_welcome))
+    app.add_handler(CommandHandler("info", info))
 
     # Handlers
     app.add_handler(ChatJoinRequestHandler(join_request_handler))
