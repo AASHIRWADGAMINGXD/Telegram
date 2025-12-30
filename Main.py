@@ -4,11 +4,10 @@ import os
 import sys
 import re
 import asyncio
-from datetime import datetime
-from dotenv import load_dotenv  # New: Loads .env file
+from dotenv import load_dotenv  # pip install python-dotenv
 
 from telegram import Update, ChatPermissions
-from telegram.constants import ParseMode, ChatAction
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -17,24 +16,24 @@ from telegram.ext import (
     filters,
 )
 
-# ================= ⚙️ CONFIGURATION (SECURE) =================
-# 1. Load environment variables
+# ================= ⚙️ CONFIGURATION =================
+# Load .env file
 load_dotenv()
 
-# 2. Get Keys securely
+# Get Keys
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OWNER_ID = os.getenv("OWNER_ID")
 
-# 3. Validation
+# Validation
 if not BOT_TOKEN:
     print("❌ ERROR: BOT_TOKEN is missing in .env file.")
     sys.exit(1)
 
 if OWNER_ID:
-    OWNER_ID = int(OWNER_ID)
-else:
-    print("⚠️ WARNING: OWNER_ID is missing. Some commands won't work.")
+    try:
+        OWNER_ID = int(OWNER_ID)
+    except ValueError:
+        print("⚠️ WARNING: OWNER_ID must be a number.")
 
 # Database File
 DATA_FILE = "bot_data.json"
@@ -43,24 +42,22 @@ DATA_FILE = "bot_data.json"
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ================= 💾 ADVANCED DATABASE =================
+# ================= 💾 DATABASE SYSTEM =================
 class DataManager:
     def __init__(self):
         self.data = self._load()
 
     def _load(self):
         if not os.path.exists(DATA_FILE):
-            # Default Database Structure
             return {
                 "chats": {}, 
-                "gban_list": [], 
-                "stats": {"total_msgs": 0}
+                "gban_list": []
             }
         try:
             with open(DATA_FILE, "r") as f:
                 return json.load(f)
         except:
-            return {"chats": {}, "gban_list": [], "stats": {"total_msgs": 0}}
+            return {"chats": {}, "gban_list": []}
 
     def save(self):
         with open(DATA_FILE, "w") as f:
@@ -72,17 +69,13 @@ class DataManager:
             self.data["chats"][cid] = {
                 "settings": {
                     "welcome": True,
-                    "goodbye": False,
                     "antilink": False,
-                    "ai_mode": False
                 },
                 "text": {
                     "welcome": "Hello {name}, welcome to {chat}!",
-                    "rules": "No rules set."
                 },
                 "filters": {},
-                "locked": [],
-                "warns": {}
+                "locked": []
             }
             self.save()
         return self.data["chats"][cid]
@@ -276,25 +269,6 @@ async def staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
             txt += f"- {a.user.full_name}\n"
     await update.message.reply_text(txt)
 
-# ================= 🧠 5. AI INTEGRATION (SECURE) =================
-async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not OPENAI_API_KEY: 
-        return await update.message.reply_text("❌ No OpenAI API Key found in .env file.")
-    
-    import openai
-    # Set key dynamically
-    openai.api_key = OPENAI_API_KEY
-    
-    q = " ".join(context.args)
-    if not q: return await update.message.reply_text("Usage: /ask <question>")
-    
-    msg = await update.message.reply_text("⌛ Thinking...")
-    try:
-        res = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=[{"role":"user", "content":q}])
-        await msg.edit_text(res.choices[0].message.content)
-    except Exception as e:
-        await msg.edit_text(f"AI Error: {e}")
-
 # ================= 👮 6. MESSAGE HANDLER =================
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text: return
@@ -315,7 +289,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 3. Anti-Link
     if chat_data["settings"]["antilink"] and not is_adm:
-        # Regex for urls
         if re.search(r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+", text):
             await update.message.delete()
             return
@@ -351,11 +324,8 @@ async def welcome_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================= 🚀 STARTUP =================
 def main():
-    print("🚀 Secure Bot Starting...")
-    if not BOT_TOKEN:
-        print("❌ CRITICAL ERROR: BOT_TOKEN is missing!")
-        return
-
+    print("🚀 Bot Starting...")
+    
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Admin
@@ -373,17 +343,16 @@ def main():
     app.add_handler(CommandHandler("setwelcome", set_welcome))
     app.add_handler(CommandHandler("filter", filter_cmd))
     
-    # Info & AI
+    # Info
     app.add_handler(CommandHandler("info", info))
     app.add_handler(CommandHandler("id", info))
     app.add_handler(CommandHandler("staff", staff))
-    app.add_handler(CommandHandler("ask", ask))
 
     # Handlers
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    print("✅ Bot is Online and polling...")
+    print("✅ Bot is Online! (Ensure only ONE instance is running)")
     app.run_polling()
 
 if __name__ == "__main__":
