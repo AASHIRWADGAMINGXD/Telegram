@@ -294,7 +294,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # 4. Locks
-    if not is_adm:
+    if is_adm:
         if "text" in chat_data["locked"]:
             await update.message.delete()
             return
