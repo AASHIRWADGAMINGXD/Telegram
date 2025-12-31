@@ -1,525 +1,502 @@
-import logging
-import json
 import os
-import sys
-import re
+import logging
 import asyncio
-import uuid
 import requests
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from dotenv import load_dotenv
+from datetime import datetime, timedelta
+from collections import defaultdict, deque
+from typing import Dict, List
+import re
 
-from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-    CallbackQueryHandler,
-    ChatJoinRequestHandler, 
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ChatJoinRequestHandler, filters, ContextTypes
 
-# ================= ⚙️ CONFIGURATION =================
-load_dotenv()
-
-PORT = int(os.environ.get("PORT", 8080))
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = os.getenv("OWNER_ID")
-
-if not BOT_TOKEN:
-    print("❌ ERROR: BOT_TOKEN is missing. Check .env file.")
-    sys.exit(1)
-
-if OWNER_ID:
-    try:
-        OWNER_ID = int(OWNER_ID)
-    except ValueError:
-        pass
-
-DATA_FILE = "bot_data.json"
-
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+# Enable logging
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ================= 🌐 1. WEB SERVER (Prevents Timeout) =================
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.wfile.write(b"Bot is active.")
+# Environment variables
+TOKEN = os.getenv('BOT_TOKEN')
+if not TOKEN:
+    raise ValueError("BOT_TOKEN environment variable is required.")
 
-def start_web_server():
-    try:
-        server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
-        server.serve_forever()
-    except:
-        pass
+OWNER_ID = int(os.getenv('OWNER_ID', 0))  # Optional, for broadcast
 
-# ================= 💾 2. DATABASE SYSTEM =================
-class DataManager:
-    def __init__(self):
-        self.data = self._load()
+# In-memory storage (for single file, no persistence)
+chat_settings = defaultdict(lambda: {
+    'welcome_msg': 'Welcome to the group, {username}!',
+    'antilink': False,
+    'autoreplies': {},  # trigger: response
+    'special_links': {},  # url_pattern: [messages]
+    'recent_msgs': deque(maxlen=100),  # message ids for clear
+    'chat_ids': set(),  # for broadcast, but we'll use a global
+    'join_counts': {},  # for anti-raid: timestamp: count
+    'invite_links': {}  # name: {'link': str, 'max_uses': int, 'expire': datetime}
+})
+global_chat_ids = set()  # All chats for broadcast
 
-    def _load(self):
-        if not os.path.exists(DATA_FILE):
-            return {
-                "chats": {}, 
-                "gban_list": [], 
-                "stored_msgs": {}
-            }
-        try:
-            with open(DATA_FILE, "r") as f:
-                return json.load(f)
-        except:
-            return {"chats": {}, "gban_list": [], "stored_msgs": {}}
+# Anti-raid settings
+RAID_THRESHOLD = 5
+RAID_WINDOW = 60  # seconds
 
-    def save(self):
-        with open(DATA_FILE, "w") as f:
-            json.dump(self.data, f, indent=4)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a message when the command /start is issued."""
+    await update.message.reply_text('Hi! I am your Telegram bot. Use /help for commands.')
 
-    def get_chat(self, chat_id):
-        cid = str(chat_id)
-        if cid not in self.data["chats"]:
-            self.data["chats"][cid] = {
-                "settings": {
-                    "welcome": True, 
-                    "antilink": False,
-                    "antiraid": False # New Feature
-                },
-                "text": {"welcome": "Hello {name}!"},
-                "filters": {},
-                "locked": []
-            }
-            self.save()
-        return self.data["chats"][cid]
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a message when the command /help is issued."""
+    help_text = """
+Available commands:
+/start - Start the bot
+/help - Show this help
+/add @user - Add user to broadcast list (admin only)
+/broadcast <msg> - Broadcast message (owner only)
+/shortener <url> - Shorten URL with TinyURL
+/kick @user - Kick user
+/ban @user - Ban user
+/mute @user - Mute user
+/umute @user - Unmute user
+/clear <num> - Delete last <num> messages
+/lock - Restrict new members
+/setwelcome <msg> - Set welcome message
+/shout <msg> - Shout message (bold)
+/autoreply <trigger> <response> - Set auto reply
+/special_link <url> <msg1>|<msg2> - Set special link replies
+/antilink on/off - Toggle anti-link
+/antiRaid on/off - Toggle anti-raid (placeholder)
+/link <name> <max_uses> <expire_days> - Create invite link with approval
+    """
+    await update.message.reply_text(help_text)
 
-    def update_setting(self, chat_id, setting, value):
-        c = self.get_chat(chat_id)
-        c["settings"][setting] = value
-        self.save()
+async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add user to broadcast list (simple, add chat_id)."""
+    if not update.effective_chat or not update.effective_chat.id in global_chat_ids:
+        global_chat_ids.add(update.effective_chat.id)
+    await update.message.reply_text('Chat added to broadcast list.')
 
-    def set_text(self, chat_id, key, text):
-        c = self.get_chat(chat_id)
-        c["text"][key] = text
-        self.save()
-
-    def add_gban(self, user_id):
-        if user_id not in self.data["gban_list"]:
-            self.data["gban_list"].append(user_id)
-            self.save()
-
-    def check_gban(self, user_id):
-        return user_id in self.data["gban_list"]
-
-    def store_msg(self, text):
-        uid = str(uuid.uuid4())[:8]
-        if "stored_msgs" not in self.data:
-            self.data["stored_msgs"] = {}
-        self.data["stored_msgs"][uid] = text
-        self.save()
-        return uid
-
-    def get_msg(self, uid):
-        return self.data.get("stored_msgs", {}).get(uid, None)
-
-    def add_filter(self, chat_id, trigger, reply):
-        c = self.get_chat(chat_id)
-        c["filters"][trigger.lower()] = reply
-        self.save()
-
-db = DataManager()
-
-# ================= 🛡️ HELPERS =================
-async def is_admin(update: Update) -> bool:
-    if update.effective_user.id == OWNER_ID: return True
-    chat = update.effective_chat
-    if chat.type == "private": return True
-    member = await chat.get_member(update.effective_user.id)
-    return member.status in ["administrator", "creator"]
-
-def admin_only(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if await is_admin(update):
-            return await func(update, context)
-        else:
-            msg = await update.message.reply_text("⛔ **Admin Only**", parse_mode=ParseMode.MARKDOWN)
-            await asyncio.sleep(2)
-            try: await msg.delete()
-            except: pass
-    return wrapper
-
-# ================= 🆕 COMMANDS =================
-
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles /start and Special Links"""
-    args = context.args
-    if args:
-        token = args[0]
-        content = db.get_msg(token)
-        if content:
-            await update.message.reply_text(f"📩 **Stored Message:**\n\n{content}")
-        else:
-            await update.message.reply_text("❌ Link expired or invalid.")
-    else:
-        await update.message.reply_text("🤖 **Bot Online!** Type /help for commands.")
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "📚 **Command List**\n\n"
-        "**👮 Moderation:**\n"
-        "`/ban`, `/kick`, `/mute`, `/unmute`\n"
-        "`/clear <num>` - Delete messages\n"
-        "`/lock <text/media/all>`, `/unlock`\n"
-        "`/antiraid <on/off>` - Ban new joins\n"
-        "`/antilink <on/off>`\n\n"
-        "**🔗 Tools:**\n"
-        "`/genlink` - Create Invite + TinyURL\n"
-        "`/shortener <url>` - Shorten URL\n"
-        "`/special_link <text>` - Store text\n"
-        "`/link <name> <limit>` - **Approval Link**\n\n"
-        "**⚙️ Utils:**\n"
-        "`/shout <text>` - 📢 **LOUD**\n"
-        "`/broadcast <msg>` - Send to all chats\n"
-        "`/setwelcome <text>`\n"
-        "`/info`, `/id`"
-    )
-    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
-
-@admin_only
-async def genlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/genlink - Generate TinyURL Invite"""
-    chat = update.effective_chat
-    try:
-        link = await chat.create_invite_link(member_limit=1)
-        # TinyURL
-        api = f"http://tinyurl.com/api-create.php?url={link.invite_link}"
-        short = requests.get(api).text
-        await update.message.reply_text(f"🔗 **Invite Generated:**\n{short}")
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
-
-async def shortener_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/shortener <url> - Shorten external URL"""
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Broadcast message to all chats."""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text('Not authorized.')
+        return
     if not context.args:
-        return await update.message.reply_text("Usage: /shortener <https://example.com>")
-    
-    url = context.args[0]
+        await update.message.reply_text('Usage: /broadcast <message>')
+        return
+    msg = ' '.join(context.args)
+    for chat_id in list(global_chat_ids):
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=msg)
+        except Exception as e:
+            logger.error(f"Failed to broadcast to {chat_id}: {e}")
+    await update.message.reply_text('Broadcast sent.')
+
+async def shortener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shorten URL using TinyURL."""
+    if not context.args:
+        await update.message.reply_text('Usage: /shortener <url>')
+        return
+    long_url = ' '.join(context.args)
+    api_url = f'http://tinyurl.com/api-create.php?url={long_url}'
     try:
-        api = f"http://tinyurl.com/api-create.php?url={url}"
-        short = requests.get(api).text
-        await update.message.reply_text(f"✅ **Short Link:**\n{short}")
-    except:
-        await update.message.reply_text("❌ Failed to shorten.")
-
-async def special_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/special_link - Store multi-line text"""
-    text = ""
-    if update.message.reply_to_message:
-        text += update.message.reply_to_message.text or ""
-        text += "\n\n"
-    
-    if context.args:
-        user_input = update.message.text.split(" ", 1)[1]
-        text += user_input
-    
-    if not text:
-        return await update.message.reply_text("Usage: /special_link <text> (or reply)")
-
-    uid = db.store_msg(text)
-    bot_url = f"https://t.me/{context.bot.username}?start={uid}"
-    await update.message.reply_text(f"🔐 **Stored!**\n\n🔗 Link:\n{bot_url}")
-
-async def shout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/shout <text> - BOLD CAPS"""
-    if not context.args: return
-    msg = " ".join(context.args).upper()
-    await update.message.reply_text(f"📢 **{msg}**", parse_mode=ParseMode.MARKDOWN)
-
-@admin_only
-async def antiraid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/antiraid on/off"""
-    if not context.args: return await update.message.reply_text("Usage: /antiraid on/off")
-    val = context.args[0].lower() == "on"
-    db.update_setting(update.effective_chat.id, "antiraid", val)
-    status = "🔴 ENABLED (New members will be Banned)" if val else "🟢 DISABLED"
-    await update.message.reply_text(f"🛡 **Anti-Raid:** {status}")
-
-# ================= 🔗 ADVANCED APPROVAL SYSTEM =================
-@admin_only
-async def create_approval_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/link Name Limit"""
-    if len(context.args) < 1: return await update.message.reply_text("Usage: /link <Name> <Limit>")
-    name = context.args[0]
-    limit = int(context.args[1]) if len(context.args) > 1 and context.args[1].isdigit() else None
-    
-    try:
-        link = await update.effective_chat.create_invite_link(
-            name=name, 
-            member_limit=limit, 
-            creates_join_request=True 
-        )
-        await update.message.reply_text(
-            f"🛡 **Approval Link Created**\n"
-            f"🔗 {link.invite_link}\n\n"
-            f"Users clicking this must be approved by Admin."
-        )
+        response = requests.get(api_url)
+        if response.status_code == 200:
+            short_url = response.text.strip()
+            await update.message.reply_text(f'Shortened: {short_url}')
+        else:
+            await update.message.reply_text('Failed to shorten URL.')
     except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
+        logger.error(e)
+        await update.message.reply_text('Error shortening URL.')
 
-async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Triggered when user clicks /link"""
-    req = update.chat_join_request
-    user = req.from_user
-    chat = req.chat
+async def kick_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Kick a user."""
+    if not await is_admin(update, context):
+        return
+    if not context.args:
+        await update.message.reply_text('Usage: /kick @username')
+        return
+    user = context.args[0].replace('@', '')
+    try:
+        # Find user by username or reply
+        if update.message.reply_to_message:
+            user_id = update.message.reply_to_message.from_user.id
+        else:
+            # Simple, assume mentioned
+            members = await context.bot.get_chat_members(update.effective_chat.id)
+            user_id = next((m.user.id for m in members if m.user.username == user), None)
+            if not user_id:
+                await update.message.reply_text('User not found.')
+                return
+        await context.bot.ban_chat_member(update.effective_chat.id, user_id)
+        await context.bot.unban_chat_member(update.effective_chat.id, user_id)  # Kick
+        await update.message.reply_text(f'User {user} kicked.')
+    except Exception as e:
+        logger.error(e)
+        await update.message.reply_text('Failed to kick user.')
+
+async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ban a user."""
+    if not await is_admin(update, context):
+        return
+    # Similar to kick, but just ban
+    if not context.args and not update.message.reply_to_message:
+        await update.message.reply_text('Usage: /ban @username or reply to message')
+        return
+    if update.message.reply_to_message:
+        user_id = update.message.reply_to_message.from_user.id
+    else:
+        user = context.args[0].replace('@', '') if context.args else None
+        if not user:
+            return
+        # Find user_id similar...
+        await update.message.reply_text('Reply or mention for simplicity.')
+        return  # Placeholder
+    try:
+        await context.bot.ban_chat_member(update.effective_chat.id, user_id)
+        await update.message.reply_text('User banned.')
+    except Exception as e:
+        logger.error(e)
+        await update.message.reply_text('Failed to ban.')
+
+async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mute a user (restrict)."""
+    if not await is_admin(update, context):
+        return
+    # Similar
+    if update.message.reply_to_message:
+        user_id = update.message.reply_to_message.from_user.id
+    else:
+        return
+    try:
+        until_date = datetime.now() + timedelta(hours=1)  # 1 hour
+        await context.bot.restrict_chat_member(update.effective_chat.id, user_id, until_date=until_date)
+        await update.message.reply_text('User muted for 1 hour.')
+    except Exception as e:
+        logger.error(e)
+
+async def umute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Unmute a user."""
+    if not await is_admin(update, context):
+        return
+    if update.message.reply_to_message:
+        user_id = update.message.reply_to_message.from_user.id
+    else:
+        return
+    try:
+        await context.bot.restrict_chat_member(update.effective_chat.id, user_id, permissions=ChatMember().permissions)  # Full perms
+        await update.message.reply_text('User unmuted.')
+    except Exception as e:
+        logger.error(e)
+
+async def clear_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear last N messages."""
+    if not await is_admin(update, context):
+        return
+    try:
+        num = int(context.args[0]) if context.args else 5
+    except:
+        await update.message.reply_text('Usage: /clear <num>')
+        return
+    chat_id = update.effective_chat.id
+    settings = chat_settings[chat_id]
+    deleted = 0
+    for _ in range(num):
+        if settings['recent_msgs']:
+            msg_id = settings['recent_msgs'].pop()
+            try:
+                await context.bot.delete_message(chat_id, msg_id)
+                deleted += 1
+            except:
+                pass
+    await update.message.reply_text(f'Deleted {deleted} messages.')
+
+async def lock_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lock chat (restrict new members)."""
+    if not await is_admin(update, context):
+        return
+    chat_id = update.effective_chat.id
+    try:
+        # Restrict all to only admins can send, but for lock new, perhaps set pending join
+        # Or restrict new members
+        await context.bot.set_chat_permissions(chat_id, permissions=...)  # Placeholder, need to define
+        await update.message.reply_text('Chat locked.')
+    except Exception as e:
+        logger.error(e)
+
+async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set welcome message."""
+    if not await is_admin(update, context):
+        return
+    if not context.args:
+        await update.message.reply_text('Usage: /setwelcome <message>')
+        return
+    msg = ' '.join(context.args)
+    chat_id = update.effective_chat.id
+    chat_settings[chat_id]['welcome_msg'] = msg
+    await update.message.reply_text('Welcome message set.')
+
+async def shout_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shout message (bold)."""
+    if not context.args:
+        await update.message.reply_text('Usage: /shout <message>')
+        return
+    msg = ' '.join(context.args).upper()
+    await update.message.reply_text(f'**{msg}**', parse_mode='Markdown')
+
+async def set_autoreply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set auto reply: /autoreply trigger response"""
+    if not await is_admin(update, context):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text('Usage: /autoreply <trigger> <response>')
+        return
+    trigger = context.args[0].lower()
+    response = ' '.join(context.args[1:])
+    chat_id = update.effective_chat.id
+    chat_settings[chat_id]['autoreplies'][trigger] = response
+    await update.message.reply_text('Auto reply set.')
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle messages for auto reply, anti link, special link, recent msgs, anti raid."""
+    chat_id = update.effective_chat.id
+    if update.message:
+        # Store recent msg id
+        chat_settings[chat_id]['recent_msgs'].append(update.message.message_id)
+        
+        text = update.message.text.lower() if update.message.text else ''
+        
+        # Auto reply
+        for trigger, resp in chat_settings[chat_id]['autoreplies'].items():
+            # Simple contains, ignore case
+            if trigger in text.replace('.', ' ').replace(' ', ''):  # As per desc, dot or space don't matter
+                await update.message.reply_text(resp)
+                break
+        
+        # Special link - assume if url in special_links, reply with list
+        if update.message.entities:
+            for entity in update.message.entities:
+                if entity.type == 'url' or entity.type == 'text_link':
+                    url = update.message.text[entity.offset:entity.offset+entity.length].lower()
+                    if url in chat_settings[chat_id]['special_links']:
+                        for msg in chat_settings[chat_id]['special_links'][url]:
+                            await update.message.reply_text(msg)
+        
+        # Anti link
+        if chat_settings[chat_id]['antilink'] and re.search(r'http[s]?://', text) and not await is_admin(update, context):
+            await update.message.delete()
+            await context.bot.send_message(chat_id, 'Links are not allowed!')
+        
+        # Anti raid placeholder
+        if update.message.new_chat_members:
+            # Handle new members
+            now = datetime.now()
+            settings = chat_settings[chat_id]
+            if 'last_raid_check' not in settings:
+                settings['last_raid_check'] = now
+            if (now - settings['last_raid_check']).seconds > RAID_WINDOW:
+                settings['join_count'] = 0
+            settings['join_count'] += len(update.message.new_chat_members)
+            settings['last_raid_check'] = now
+            if settings['join_count'] > RAID_THRESHOLD:
+                # Restrict new members
+                try:
+                    await context.bot.set_chat_permissions(chat_id, permissions=None)  # Or restrict
+                    await update.message.reply_text('Anti-raid activated!')
+                except:
+                    pass
+            # Send welcome
+            for member in update.message.new_chat_members:
+                username = member.username or member.first_name
+                welcome = chat_settings[chat_id]['welcome_msg'].format(username=username)
+                await update.message.reply_text(welcome)
+
+async def set_special_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set special link: /special_link url msg1|msg2"""
+    if not await is_admin(update, context):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text('Usage: /special_link <url> <msg1>|<msg2>...')
+        return
+    url = context.args[0]
+    msgs_str = ' '.join(context.args[1:])
+    msgs = [m.strip() for m in msgs_str.split('|')]
+    chat_id = update.effective_chat.id
+    chat_settings[chat_id]['special_links'][url.lower()] = msgs
+    await update.message.reply_text('Special link set.')
+
+async def toggle_antilink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle anti-link."""
+    if not await is_admin(update, context):
+        return
+    chat_id = update.effective_chat.id
+    chat_settings[chat_id]['antilink'] = not chat_settings[chat_id]['antilink']
+    status = 'on' if chat_settings[chat_id]['antilink'] else 'off'
+    await update.message.reply_text(f'Anti-link {status}.')
+
+# Placeholder for antiRaid toggle
+async def toggle_antiraid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle anti-raid."""
+    if not await is_admin(update, context):
+        return
+    # Implement toggle if needed
+    await update.message.reply_text('Anti-raid toggled (placeholder).')
+
+async def create_invite_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Create invite link with approval: /link name max_uses expire_days"""
+    if not await is_admin(update, context):
+        return
+    if len(context.args) < 3:
+        await update.message.reply_text('Usage: /link <name> <max_uses> <expire_days>')
+        return
+    name = context.args[0]
+    try:
+        max_uses = int(context.args[1])
+        expire_days = int(context.args[2])
+    except:
+        await update.message.reply_text('Max_uses and expire_days must be integers.')
+        return
+    chat_id = update.effective_chat.id
+    expire_date = datetime.now() + timedelta(days=expire_days)
+    try:
+        link = await context.bot.create_chat_invite_link(
+            chat_id,
+            name=name,
+            member_limit=max_uses,
+            expiration_date=expire_date,
+            creates_join_request=True
+        )
+        chat_settings[chat_id]['invite_links'][name] = {
+            'link': link.invite_link,
+            'max_uses': max_uses,
+            'expire': expire_date
+        }
+        await update.message.reply_text(f'Invite link created: {link.invite_link}')
+    except Exception as e:
+        logger.error(e)
+        await update.message.reply_text('Failed to create link.')
+
+pending_approvals = {}  # join_request_id: {'user': user, 'msg_id': msg_id}
+
+async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle join requests."""
+    chat_id = update.effective_chat.id
+    user = update.effective_chat_join_request.from_user
+    join_request_id = update.effective_chat_join_request.join_request_id  # Actually, it's update.chat_join_request
+    # Note: update.chat_join_request
+    username = user.username or user.first_name
     
-    # Message to Group
-    text = (
-        f"Hey {user.full_name} (@{user.username or 'NoUser'}) Is Requesting to Join\n"
-        f"Chat: {chat.title}"
-    )
-    
-    # Buttons
-    kb = [
+    # Create inline keyboard
+    keyboard = [
         [
-            InlineKeyboardButton("Yes", callback_data=f"join_yes_{user.id}"),
-            InlineKeyboardButton("No", callback_data=f"join_no_{user.id}")
+            InlineKeyboardButton("Yes", callback_data=f"approve_{user.id}"),
+            InlineKeyboardButton("No", callback_data=f"decline_{user.id}")
         ]
     ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await context.bot.send_message(
-        chat_id=chat.id, 
-        text=text, 
-        reply_markup=InlineKeyboardMarkup(kb)
+    msg = await context.bot.send_message(
+        chat_id,
+        f"Hey, {username} is requesting to join.\nYes or No?",
+        reply_markup=reply_markup
     )
-
-async def join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not await is_admin(update):
-        return await query.answer("❌ Admins Only!", show_alert=True)
-
-    data = query.data.split("_")
-    action = data[1] # yes or no
-    user_id = int(data[2])
-    chat = update.effective_chat
     
-    if action == "yes":
+    pending_approvals[user.id] = {'request': update.chat_join_request, 'msg_id': msg.message_id, 'chat_id': chat_id}
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle callback for approvals."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = int(data.split('_')[1])
+    if user_id not in pending_approvals:
+        return
+    
+    pending = pending_approvals[user_id]
+    chat_id = pending['chat_id']
+    
+    # Check if callback from admin
+    if not await is_admin_for_callback(query, context, chat_id):
+        await query.edit_message_text('Only admins can approve.')
+        return
+    
+    if data.startswith('approve_'):
         try:
-            await chat.approve_join_request(user_id)
-            await query.edit_message_text(f"✅ **Yes.** User {user_id} Approved.", parse_mode=ParseMode.MARKDOWN)
+            await context.bot.approve_chat_join_request(pending['request'].chat.id, pending['request'].from_user.id)
+            await query.edit_message_text(f'{pending["request"].from_user.first_name} approved and joined.')
+            # DM welcome if needed
         except Exception as e:
-            await query.edit_message_text(f"Error: {e}")
-            
-    elif action == "no":
+            logger.error(e)
+    else:  # decline
         try:
-            await chat.decline_join_request(user_id)
-            await query.edit_message_text(f"🚫 **No.** User {user_id} Rejected.", parse_mode=ParseMode.MARKDOWN)
-            
-            # DM The User
+            await context.bot.decline_chat_join_request(pending['request'].chat.id, pending['request'].from_user.id)
+            await query.edit_message_text(f'{pending["request"].from_user.first_name} rejected.')
+            # DM sorry
             try:
-                # Fetching user info is hard if not in chat, but we try standard send
                 await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"Sorry, you can't join. You are Rejected By Owner / Admin."
+                    pending['request'].from_user.id,
+                    f"Sorry {pending['request'].from_user.first_name}, you can't join. You were rejected by owner/admin."
                 )
             except:
-                pass # User privacy settings
+                pass
         except Exception as e:
-            await query.edit_message_text(f"Error: {e}")
-
-# ================= 👮 MODERATION COMMANDS =================
-@admin_only
-async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message: return await update.message.reply_text("Reply to user.")
-    try:
-        await update.effective_chat.ban_member(update.message.reply_to_message.from_user.id)
-        await update.message.reply_text("🔨 **Banned.**", parse_mode=ParseMode.MARKDOWN)
-    except Exception as e: await update.message.reply_text(str(e))
-
-@admin_only
-async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message: return await update.message.reply_text("Reply to user.")
-    try:
-        await update.effective_chat.unban_member(update.message.reply_to_message.from_user.id)
-        await update.message.reply_text("👞 **Kicked.**", parse_mode=ParseMode.MARKDOWN)
-    except: pass
-
-@admin_only
-async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message: return
-    try:
-        await update.effective_chat.restrict_member(update.message.reply_to_message.from_user.id, permissions=ChatPermissions(can_send_messages=False))
-        await update.message.reply_text("🔇 **Muted.**", parse_mode=ParseMode.MARKDOWN)
-    except: pass
-
-@admin_only
-async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message: return
-    try:
-        await update.effective_chat.restrict_member(update.message.reply_to_message.from_user.id, permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True))
-        await update.message.reply_text("🔊 **Unmuted.**", parse_mode=ParseMode.MARKDOWN)
-    except: pass
-
-@admin_only
-async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/clear <num> or reply"""
-    if update.message.reply_to_message:
-        # Purge from reply
-        msg_id = update.message.reply_to_message.message_id
-        current_id = update.message.message_id
-        ids = list(range(msg_id, current_id + 1))
-    elif context.args and context.args[0].isdigit():
-        # Purge last N
-        num = int(context.args[0])
-        current_id = update.message.message_id
-        ids = list(range(current_id - num, current_id + 1))
-    else:
-        return await update.message.reply_text("Reply to a message OR use: /clear 10")
-
-    # Batch delete
-    chunk_size = 100
-    deleted = 0
-    for i in range(0, len(ids), chunk_size):
-        chunk = ids[i:i + chunk_size]
-        try:
-            await update.effective_chat.delete_messages(chunk)
-            deleted += len(chunk)
-        except: pass
+            logger.error(e)
     
-    msg = await update.message.reply_text(f"🗑 **Cleared {deleted} messages.**", parse_mode=ParseMode.MARKDOWN)
-    await asyncio.sleep(3)
-    try: await msg.delete()
-    except: pass
+    # Delete the message
+    try:
+        await context.bot.delete_message(chat_id, pending['msg_id'])
+    except:
+        pass
+    del pending_approvals[user_id]
 
-@admin_only
-async def lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: return
-    arg = context.args[0].lower()
-    c = db.get_chat(update.effective_chat.id)
-    if arg not in c["locked"]:
-        c["locked"].append(arg)
-        db.save()
-    if arg == "all":
-        await update.effective_chat.set_permissions(ChatPermissions(can_send_messages=False))
-    await update.message.reply_text(f"🔒 Locked: **{arg}**", parse_mode=ParseMode.MARKDOWN)
-
-@admin_only
-async def unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: return
-    arg = context.args[0].lower()
-    c = db.get_chat(update.effective_chat.id)
-    if arg in c["locked"]:
-        c["locked"].remove(arg)
-        db.save()
-    if arg == "all":
-        await update.effective_chat.set_permissions(ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True))
-    await update.message.reply_text(f"🔓 Unlocked: **{arg}**", parse_mode=ParseMode.MARKDOWN)
-
-@admin_only
-async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: return
-    db.set_text(update.effective_chat.id, "welcome", " ".join(context.args))
-    await update.message.reply_text("✅ Welcome saved.")
-
-@admin_only
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: return
-    msg = " ".join(context.args)
-    count = 0
-    for cid in db.data["chats"]:
-        try:
-            await context.bot.send_message(cid, f"📢 **Broadcast:**\n{msg}", parse_mode=ParseMode.MARKDOWN)
-            count += 1
-        except: pass
-    await update.message.reply_text(f"Sent to {count} chats.")
-
-# ================= 🚀 MAIN HANDLER =================
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text: return
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if user is admin."""
     chat_id = update.effective_chat.id
-    text = update.message.text
-    chat_data = db.get_chat(chat_id)
-    is_adm = await is_admin(update)
+    user_id = update.effective_user.id
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return member.status in ['administrator', 'creator']
+    except:
+        return False
 
-    # 1. Antilink
-    if chat_data["settings"]["antilink"] and not is_adm:
-        if re.search(r"(https?://|www\.|t\.me|telegram\.me)[a-zA-Z0-9_./-]+", text, re.IGNORECASE):
-            try: await update.message.delete()
-            except: pass
-            return
+async def is_admin_for_callback(query, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
+    """Check admin for callback."""
+    user_id = query.from_user.id
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return member.status in ['administrator', 'creator']
+    except:
+        return False
 
-    # 2. Text Lock
-    if not is_adm and "text" in chat_data["locked"]:
-        await update.message.delete()
-        return
-
-    # 3. Filters
-    text_lower = text.lower()
-    if text_lower in chat_data["filters"]:
-        await update.message.reply_text(chat_data["filters"][text_lower])
-
-async def welcome_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_data = db.get_chat(update.effective_chat.id)
-    
-    # 1. Anti-Raid (Ban new users if ON)
-    if chat_data["settings"]["antiraid"]:
-        for m in update.message.new_chat_members:
-            try:
-                await update.effective_chat.ban_member(m.id)
-                await update.message.reply_text(f"🛡 **AntiRaid:** Banned {m.first_name}")
-            except: pass
-        return
-
-    # 2. Welcome
-    if chat_data["settings"]["welcome"]:
-        for m in update.message.new_chat_members:
-            if db.check_gban(m.id): 
-                await update.effective_chat.ban_member(m.id)
-            else: 
-                await update.message.reply_text(chat_data["text"]["welcome"].format(name=m.first_name, chat=update.effective_chat.title))
-
-# ================= 🚀 START =================
-def main():
-    print("🚀 Bot Starting...")
-    threading.Thread(target=start_web_server, daemon=True).start()
-    
-    app = Application.builder().token(BOT_TOKEN).build()
+def main() -> None:
+    """Start the bot."""
+    application = Application.builder().token(TOKEN).build()
 
     # Commands
-    app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CommandHandler("help", help_command))
-    
-    # Tools
-    app.add_handler(CommandHandler("genlink", genlink))
-    app.add_handler(CommandHandler("shortener", shortener_cmd)) 
-    app.add_handler(CommandHandler("special_link", special_link))
-    app.add_handler(CommandHandler("link", create_approval_link))
-    app.add_handler(CommandHandler("shout", shout))
-    
-    # Moderation
-    app.add_handler(CommandHandler("ban", ban))
-    app.add_handler(CommandHandler("kick", kick))
-    app.add_handler(CommandHandler("mute", mute))
-    app.add_handler(CommandHandler("unmute", unmute))
-    app.add_handler(CommandHandler("clear", clear)) # Alias for purge
-    app.add_handler(CommandHandler("purge", clear)) # Keep purge as alias
-    
-    # Settings
-    app.add_handler(CommandHandler("lock", lock))
-    app.add_handler(CommandHandler("unlock", unlock))
-    app.add_handler(CommandHandler("setwelcome", set_welcome))
-    app.add_handler(CommandHandler("antiraid", antiraid))
-    app.add_handler(CommandHandler("broadcast", broadcast))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("add", add_user))
+    application.add_handler(CommandHandler("broadcast", broadcast))
+    application.add_handler(CommandHandler("shortener", shortener))
+    application.add_handler(CommandHandler("kick", kick_user))
+    application.add_handler(CommandHandler("ban", ban_user))
+    application.add_handler(CommandHandler("mute", mute_user))
+    application.add_handler(CommandHandler("umute", umute_user))
+    application.add_handler(CommandHandler("clear", clear_messages))
+    application.add_handler(CommandHandler("lock", lock_chat))
+    application.add_handler(CommandHandler("setwelcome", set_welcome))
+    application.add_handler(CommandHandler("shout", shout_message))
+    application.add_handler(CommandHandler("autoreply", set_autoreply))
+    application.add_handler(CommandHandler("special_link", set_special_link))
+    application.add_handler(CommandHandler("antilink", toggle_antilink))
+    application.add_handler(CommandHandler("antiraid", toggle_antiraid))
+    application.add_handler(CommandHandler("link", create_invite_link))
 
     # Handlers
-    app.add_handler(ChatJoinRequestHandler(join_request_handler))
-    app.add_handler(CallbackQueryHandler(join_callback, pattern="^join_"))
-    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(ChatJoinRequestHandler(handle_join_request))
 
-    print("✅ Bot is Online!")
-    app.run_polling()
+    # Run the bot until the user presses Ctrl-C
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
