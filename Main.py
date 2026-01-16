@@ -1,24 +1,42 @@
-import os
 import logging
-import sqlite3
-import re
+import json
+import os
 import asyncio
-from datetime import datetime, timedelta
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
-from telegram.ext import (
-    ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, 
-    filters, CallbackQueryHandler, ChatJoinRequestHandler
+import datetime
+from collections import deque, defaultdict
+from flask import Flask
+from threading import Thread
+from telegram import (
+    Update, 
+    InlineKeyboardButton, 
+    InlineKeyboardMarkup, 
+    ChatPermissions, 
+    constants
 )
-from dotenv import load_dotenv
-import pyshorteners
-from duckduckgo_search import DDGS
+from telegram.ext import (
+    ApplicationBuilder, 
+    ContextTypes, 
+    CommandHandler, 
+    MessageHandler, 
+    CallbackQueryHandler, 
+    filters
+)
 
-from keep_alive import keep_alive
+# ==========================================
+# 1. CONFIGURATION
+# ==========================================
 
-# Load Environment Variables
-load_dotenv()
-TOKEN = os.getenv('BOT_TOKEN')
+# 🔴 PUT YOUR TOKEN HERE (Or use Environment Variables)
+TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_GOES_HERE")
+
+# Data File
+DATA_FILE = "bot_data.json"
+
+# Slowmode Configuration
+SLOWMODE_TRIGGER = 5      # Messages count
+SLOWMODE_WINDOW = 5       # Seconds window
+SLOWMODE_DURATION = 10    # Slowmode duration in seconds
+SLOWMODE_COOLDOWN = 2     # Turn off if msgs < this
 
 # Logging Setup
 logging.basicConfig(
@@ -26,378 +44,425 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# --- DATABASE MANAGER ---
-class DatabaseManager:
-    def __init__(self, db_name="bot_database.db"):
-        self.conn = sqlite3.connect(db_name, check_same_thread=False)
-        self.cursor = self.conn.cursor()
-        self.create_tables()
+# In-memory Data (Loaded from JSON)
+bot_data = {
+    "blocked_words": [],
+    "auto_replies": {}
+}
 
-    def create_tables(self):
-        # Users for broadcast
-        self.cursor.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)''')
-        # Settings (Welcome msg, Anti-raid status)
-        self.cursor.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
-        # Special Links (Store multiple messages)
-        self.cursor.execute('''CREATE TABLE IF NOT EXISTS special_links (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT)''')
-        self.conn.commit()
+# Traffic Monitor: {chat_id: deque([timestamps])}
+chat_traffic = defaultdict(lambda: deque(maxlen=20))
 
-    def add_user(self, user_id):
-        try:
-            self.cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-            self.conn.commit()
-        except Exception as e:
-            logging.error(f"DB Error: {e}")
+# ==========================================
+# 2. KEEP ALIVE SERVER (Flask)
+# ==========================================
+app = Flask('')
 
-    def get_all_users(self):
-        self.cursor.execute("SELECT user_id FROM users")
-        return [row[0] for row in self.cursor.fetchall()]
+@app.route('/')
+def home():
+    return "Telegram Bot is Running!"
 
-    def set_setting(self, key, value):
-        self.cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
-        self.conn.commit()
+def run_flask():
+    app.run(host='0.0.0.0', port=8080)
 
-    def get_setting(self, key):
-        self.cursor.execute("SELECT value FROM settings WHERE key=?", (key,))
-        result = self.cursor.fetchone()
-        return result[0] if result else None
+def keep_alive():
+    t = Thread(target=run_flask)
+    t.start()
 
-    def store_special_message(self, content):
-        self.cursor.execute("INSERT INTO special_links (content) VALUES (?)", (content,))
-        self.conn.commit()
-        return self.cursor.lastrowid
+# ==========================================
+# 3. DATA PERSISTENCE
+# ==========================================
+def load_data():
+    global bot_data
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'r') as f:
+            bot_data = json.load(f)
 
-db = DatabaseManager()
+def save_data():
+    with open(DATA_FILE, 'w') as f:
+        json.dump(bot_data, f, indent=4)
 
-# --- COMMAND HANDLERS ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    db.add_user(user_id)
-    await update.message.reply_text("Hello Everyone")
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = """
-Available Commands:
-/start - Start the bot
-/help - Show help
-/shout - Shout a message
-/genlink - Generate link
-/special_link - Store multiple messages
-/shortener - Shorten URL
-/broadcast - Send message to all users
-/kick - Kick a user
-/ban - Ban a user
-/mute - Mute a user
-/unmute - Unmute a user
-/clear - Clear messages
-/lock - Lock group
-/setwelcome - Set welcome message
-/antiRaid - Enable anti-raid
-/link - Approval-based join link
-/ai search - Search the web
-    """
-    await update.message.reply_text(help_text)
-
-async def shout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Please provide a message to shout.")
-        return
-
-    message = " ".join(context.args)
-    
-    # Check for blocked words
-    blocked_words = ["aashirwad ki", "anant ki"]
-    cleaned_message = message.lower().replace(" ", "")
-    
-    for blocked in blocked_words:
-        clean_blocked = blocked.replace(" ", "")
-        if clean_blocked in cleaned_message:
-            await update.message.delete()
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id, 
-                text="The Message contains blocked words"
-            )
-            return
-
-    # If clean, send loudly (uppercase)
-    await update.message.reply_text(f"Sending your message...\n\n{message.upper()}")
-
-async def genlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Generates a deep link to the bot
-    bot_username = context.bot.username
-    link = f"https://t.me/{bot_username}?start=gen_{update.effective_user.id}"
-    await update.message.reply_text(f"Link generated successfully.\n{link}")
-
-async def special_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Stores text passed after command
-    if not context.args:
-        await update.message.reply_text("Please provide text to store.")
-        return
-    
-    content = " ".join(context.args)
-    msg_id = db.store_special_message(content)
-    await update.message.reply_text(f"Messages stored successfully. ID: {msg_id}")
-
-async def shortener(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Please provide a URL.")
-        return
-    
-    url = context.args[0]
-    try:
-        s = pyshorteners.Shortener()
-        short_url = s.tinyurl.short(url)
-        await update.message.reply_text(f"Here is your shortened link.\n{short_url}")
-    except Exception as e:
-        await update.message.reply_text("Error shortening link.")
-
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Note: Admin check removed as requested "all can use command"
-    if not context.args:
-        await update.message.reply_text("Provide a message to broadcast.")
-        return
-
-    msg = " ".join(context.args)
-    users = db.get_all_users()
-    
-    count = 0
-    for user_id in users:
-        try:
-            await context.bot.send_message(chat_id=user_id, text=msg)
-            count += 1
-        except:
-            pass # User might have blocked bot
-            
-    await update.message.reply_text(f"Broadcast sent successfully to {count} users.")
-
-# --- MODERATION COMMANDS ---
+# ==========================================
+# 4. MODERATION COMMANDS
+# ==========================================
 
 async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a user to kick.")
-        return
+    """Kick user (Ban then Unban)."""
+    if not await check_admin(update): return
+    target_id = await get_target_id(update, context)
+    if not target_id: return
+
     try:
-        await update.message.chat.ban_member(update.message.reply_to_message.from_user.id)
-        await update.message.chat.unban_member(update.message.reply_to_message.from_user.id) # Unban to just kick
-        await update.message.reply_text("User has been kicked.")
+        await update.effective_chat.ban_member(target_id)
+        await update.effective_chat.unban_member(target_id)
+        await update.message.reply_text("👢 User has been kicked.")
     except Exception as e:
-        await update.message.reply_text(f"Failed: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
 
 async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a user to ban.")
-        return
+    """Ban user permanently."""
+    if not await check_admin(update): return
+    target_id = await get_target_id(update, context)
+    if not target_id: return
+
     try:
-        await update.message.chat.ban_member(update.message.reply_to_message.from_user.id)
-        await update.message.reply_text("User has been banned.")
+        await update.effective_chat.ban_member(target_id)
+        await update.message.reply_text("🔨 User has been banned.")
     except Exception as e:
-        await update.message.reply_text(f"Failed: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
 
 async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a user to mute.")
-        return
-    try:
-        permissions = ChatPermissions(can_send_messages=False)
-        # Mute for 1 hour by default if not specified
-        await update.message.chat.restrict_member(
-            update.message.reply_to_message.from_user.id,
-            permissions=permissions,
-            until_date=datetime.now() + timedelta(hours=1)
-        )
-        await update.message.reply_text("User has been muted.")
-    except Exception as e:
-        await update.message.reply_text(f"Failed: {e}")
+    """Mute user (Restrict messages)."""
+    if not await check_admin(update): return
+    target_id = await get_target_id(update, context)
+    if not target_id: return
 
-async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a user to unmute.")
-        return
+    perms = ChatPermissions(can_send_messages=False)
     try:
-        permissions = ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True)
-        await update.message.chat.restrict_member(
-            update.message.reply_to_message.from_user.id,
-            permissions=permissions
-        )
-        await update.message.reply_text("User has been unmuted.")
+        await update.effective_chat.restrict_member(target_id, permissions=perms)
+        await update.message.reply_text("🤐 User has been muted.")
     except Exception as e:
-        await update.message.reply_text(f"Failed: {e}")
-
-async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        amount = int(context.args[0]) if context.args else 5
-        message_id = update.message.message_id
-        chat_id = update.message.chat_id
-        
-        # Delete recent messages (simple loop as bulk delete is limited)
-        # Note: This is a basic implementation.
-        await update.message.reply_text("Messages cleared.")
-    except Exception as e:
-        await update.message.reply_text("Usage: /clear <number>")
+        await update.message.reply_text(f"❌ Error: {e}")
 
 async def lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lock the entire chat."""
+    if not await check_admin(update): return
+    perms = ChatPermissions(can_send_messages=False)
     try:
-        permissions = ChatPermissions(can_send_messages=False)
-        await update.message.chat.set_permissions(permissions)
-        await update.message.reply_text("Group locked successfully.")
+        await update.effective_chat.set_permissions(perms)
+        await update.message.reply_text("🔒 Chat is now LOCKED.")
     except Exception as e:
-        await update.message.reply_text(f"Failed: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
 
-async def setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Please provide welcome text.")
-        return
-    text = " ".join(context.args)
-    db.set_setting("welcome_msg", text)
-    await update.message.reply_text("Welcome message updated.")
-
-async def antiraid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db.set_setting("antiraid", "true")
-    await update.message.reply_text("Anti-raid enabled.")
-
-# --- JOIN REQUEST SYSTEM ---
-
-async def create_invite_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        # Create a link where admin approval is required
-        link = await update.message.chat.create_invite_link(creates_join_request=True)
-        await update.message.reply_text(f"Join request sent for approval.\nUse this link: {link.invite_link}")
-    except Exception as e:
-        await update.message.reply_text(f"Error: Bot must be admin. {e}")
-
-async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Triggered when someone clicks the creates_join_request link
-    req = update.chat_join_request
-    user = req.from_user
-    chat = req.chat
-
-    # Send message to the group (or admin logs)
-    keyboard = [
-        [
-            InlineKeyboardButton("Yes", callback_data=f"approve_{user.id}_{chat.id}"),
-            InlineKeyboardButton("No", callback_data=f"decline_{user.id}_{chat.id}")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await context.bot.send_message(
-        chat_id=chat.id,
-        text=f"Hey\n{user.username or user.first_name} is requesting to join",
-        reply_markup=reply_markup
+async def unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Unlock the chat."""
+    if not await check_admin(update): return
+    perms = ChatPermissions(
+        can_send_messages=True,
+        can_send_media_messages=True,
+        can_send_other_messages=True,
+        can_add_web_page_previews=True,
+        can_invite_users=True
     )
+    try:
+        await update.effective_chat.set_permissions(perms)
+        await update.message.reply_text("🔓 Chat is now UNLOCKED.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
 
-async def join_decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def blockword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /blockword add badword"""
+    if not await check_admin(update): return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /blockword <add/remove> <word>")
+        return
+
+    action = context.args[0].lower()
+    word = context.args[1].lower()
+
+    if action == "add":
+        if word not in bot_data["blocked_words"]:
+            bot_data["blocked_words"].append(word)
+            save_data()
+            await update.message.reply_text(f"🚫 Added '{word}' to blocklist.")
+    elif action == "remove":
+        if word in bot_data["blocked_words"]:
+            bot_data["blocked_words"].remove(word)
+            save_data()
+            await update.message.reply_text(f"✅ Removed '{word}' from blocklist.")
+
+# ==========================================
+# 5. ADMIN UTILITY COMMANDS
+# ==========================================
+
+async def promote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Promote user to Admin."""
+    if not await check_admin(update): return
+    target_id = await get_target_id(update, context)
+    if not target_id: return
+
+    try:
+        await update.effective_chat.promote_member(
+            target_id,
+            can_manage_chat=True, can_delete_messages=True, can_invite_users=True, can_pin_messages=True
+        )
+        await update.message.reply_text("👮 User promoted.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+async def depromote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Demote admin."""
+    if not await check_admin(update): return
+    target_id = await get_target_id(update, context)
+    if not target_id: return
+
+    try:
+        await update.effective_chat.promote_member(
+            target_id,
+            can_manage_chat=False, can_delete_messages=False, can_invite_users=False
+        )
+        await update.message.reply_text("📉 User demoted.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+async def shout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send bold message and pin it."""
+    if not await check_admin(update): return
+    text = " ".join(context.args)
+    if not text:
+        await update.message.reply_text("Usage: /shout <message>")
+        return
+    
+    msg = await update.message.reply_text(f"📢 **ANNOUNCEMENT**\n\n{text}", parse_mode=constants.ParseMode.MARKDOWN)
+    try:
+        await msg.pin()
+    except:
+        pass
+
+async def autoreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set auto reply: /autoreply hello hi there"""
+    if not await check_admin(update): return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /autoreply <trigger> <response>")
+        return
+    
+    trigger = context.args[0]
+    response = " ".join(context.args[1:])
+    bot_data["auto_replies"][trigger] = response
+    save_data()
+    await update.message.reply_text(f"🤖 Autoreply set: {trigger} -> {response}")
+
+# ==========================================
+# 6. INFO COMMANDS
+# ==========================================
+
+async def chatinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    count = await chat.get_member_count()
+    msg = (
+        f"📊 **Server Info**\n"
+        f"Name: {chat.title}\n"
+        f"ID: `{chat.id}`\n"
+        f"Members: {count}\n"
+        f"Type: {chat.type}"
+    )
+    await update.message.reply_text(msg, parse_mode=constants.ParseMode.MARKDOWN)
+
+async def userinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.reply_to_message.from_user if update.message.reply_to_message else update.message.from_user
+    msg = (
+        f"👤 **User Info**\n"
+        f"Name: {user.full_name}\n"
+        f"ID: `{user.id}`\n"
+        f"Username: @{user.username}"
+    )
+    await update.message.reply_text(msg, parse_mode=constants.ParseMode.MARKDOWN)
+
+async def avatar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.reply_to_message.from_user if update.message.reply_to_message else update.message.from_user
+    pics = await user.get_profile_photos(limit=1)
+    if pics.total_count > 0:
+        await update.message.reply_photo(pics.photos[0][-1].file_id)
+    else:
+        await update.message.reply_text("No avatar found.")
+
+# ==========================================
+# 7. ADVANCED TICKET SYSTEM (FORUM STYLE)
+# ==========================================
+
+async def setup_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /setup_ticket Title | Description | ImageURL
+    """
+    if not await check_admin(update): return
+    if not context.args:
+        await update.message.reply_text("Usage: /setup_ticket Title | Desc | [ImageURL]")
+        return
+
+    # Parse arguments
+    raw = " ".join(context.args)
+    parts = [p.strip() for p in raw.split('|')]
+    title = parts[0]
+    desc = parts[1] if len(parts) > 1 else "Click below to contact support."
+    img = parts[2] if len(parts) > 2 else None
+
+    # Build Button
+    keyboard = [[InlineKeyboardButton("📩 Open Ticket", callback_data="create_ticket")]]
+    markup = InlineKeyboardMarkup(keyboard)
+
+    # Send Embed/Message
+    txt = f"🎫 *{title}*\n\n{desc}"
+    try:
+        if img:
+            await update.message.reply_photo(img, caption=txt, parse_mode=constants.ParseMode.MARKDOWN, reply_markup=markup)
+        else:
+            await update.message.reply_text(txt, parse_mode=constants.ParseMode.MARKDOWN, reply_markup=markup)
+        await update.message.delete() # Clean up command
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+async def ticket_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    data = query.data.split("_")
-    action = data[0]
-    user_id = int(data[1])
-    chat_id = int(data[2])
-
     await query.answer()
 
-    if action == "approve":
-        try:
-            await context.bot.approve_chat_join_request(chat_id, user_id)
-            await query.edit_message_text(f"User accepted.")
-        except Exception as e:
-            await query.edit_message_text(f"Error accepting: {e}")
-            
-    elif action == "decline":
-        try:
-            await context.bot.decline_chat_join_request(chat_id, user_id)
-            await query.edit_message_text(f"User rejected.")
-            # Try to send DM
+    if query.data == "create_ticket":
+        chat = query.message.chat
+        user = query.from_user
+
+        # CHECK IF GROUP HAS TOPICS ENABLED
+        if chat.is_forum:
             try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text="Sorry, you can’t join.\nYou were rejected by owner/admin."
+                # Create Forum Topic
+                topic = await chat.create_forum_topic(
+                    name=f"Ticket - {user.first_name}",
+                    icon_custom_emoji_id=None
                 )
-            except:
-                pass # Can't DM if user hasn't started bot
-        except Exception as e:
-            await query.edit_message_text(f"Error rejecting: {e}")
+                
+                # Send Control Panel in new Topic
+                control_kb = [[InlineKeyboardButton("🔒 Close Ticket", callback_data=f"close_ticket_{topic.message_thread_id}")]]
+                
+                msg_txt = (
+                    f"👋 Hello {user.mention_markdown()}!\n\n"
+                    f"✅ **Ticket Created**\n"
+                    f"Support will be with you shortly."
+                )
+                
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    message_thread_id=topic.message_thread_id,
+                    text=msg_txt,
+                    parse_mode=constants.ParseMode.MARKDOWN,
+                    reply_markup=InlineKeyboardMarkup(control_kb)
+                )
 
-# --- AI SEARCH & MESSAGE HANDLER ---
+                # Send Link to user
+                link = f"https://t.me/c/{str(chat.id)[4:]}/{topic.message_thread_id}"
+                await query.message.reply_text(f"✅ Ticket opened! [Click Here]({link})", parse_mode=constants.ParseMode.MARKDOWN, disable_web_page_preview=True)
+            
+            except Exception as e:
+                await query.message.reply_text(f"❌ Failed to create topic. Make sure 'Topics' are enabled and I am Admin.\nError: {e}")
+        else:
+            # Fallback for normal groups
+            await query.message.reply_text("❌ Tickets require 'Topics' to be enabled in this Group Settings.")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-
-    text = update.message.text
-    
-    # AI SEARCH TRIGGER
-    if "ai search" in text.lower():
-        query = text.lower().replace("ai search", "").strip()
-        if not query:
-            await update.message.reply_text("Please provide a search query.")
-            return
-
-        await update.message.reply_text("Searching...")
+    elif query.data.startswith("close_ticket_"):
+        # Logic to close topic
+        topic_id = int(query.data.split("_")[2])
+        chat = query.message.chat
         try:
-            # Using DuckDuckGo Search
-            with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=1))
-                if results:
-                    res = results[0]
-                    reply = f"**{res['title']}**\n{res['body']}\n{res['href']}"
-                    await update.message.reply_text(reply, parse_mode="Markdown")
-                else:
-                    await update.message.reply_text("No information found.")
+            await context.bot.close_forum_topic(chat_id=chat.id, message_thread_id=topic_id)
+            await query.message.reply_text("🔒 Ticket closed.")
         except Exception as e:
-            await update.message.reply_text("No information found (Error).")
+            await query.message.reply_text(f"Error closing: {e}")
+
+# ==========================================
+# 8. MESSAGE MONITOR (Slowmode, Blocks)
+# ==========================================
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text: return
+    
+    msg = update.message
+    text = msg.text.lower()
+    chat = update.effective_chat
+
+    # 1. Blocked Words
+    if any(w in text for w in bot_data["blocked_words"]):
+        try:
+            await msg.delete()
+            await chat.send_message(f"🚫 {msg.from_user.mention_markdown()}, word blocked!", parse_mode=constants.ParseMode.MARKDOWN)
+        except:
+            pass
         return
 
-    # Check for blocked words (Redundant check if not using /shout, but good for general monitoring)
-    # The requirement specifically listed checking words under /shout, 
-    # but let's adhere to "ANTI RAID" logic slightly here or general monitoring.
-    # We will stick to the specific /shout command for the strict reply rules provided.
+    # 2. Auto Reply
+    if msg.text in bot_data["auto_replies"]:
+        await msg.reply_text(bot_data["auto_replies"][msg.text])
 
-    # Handle New Member Welcome if needed (usually handled via StatusUpdate)
+    # 3. Dynamic Slowmode
+    if chat.type in [constants.ChatType.SUPERGROUP, constants.ChatType.GROUP]:
+        cid = chat.id
+        now = datetime.datetime.now().timestamp()
+        
+        chat_traffic[cid].append(now)
+        
+        # Clean old timestamps
+        while len(chat_traffic[cid]) > 0 and chat_traffic[cid][0] < now - SLOWMODE_WINDOW:
+            chat_traffic[cid].popleft()
+            
+        count = len(chat_traffic[cid])
+        
+        # Apply Slowmode
+        if count >= SLOWMODE_TRIGGER:
+            try:
+                await chat.set_slow_mode_delay(SLOWMODE_DURATION)
+            except: pass # Bot needs rights
+        # Remove Slowmode
+        elif count <= SLOWMODE_COOLDOWN:
+            try:
+                await chat.set_slow_mode_delay(0)
+            except: pass
 
-async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for member in update.message.new_chat_members:
-        welcome_msg = db.get_setting("welcome_msg")
-        if welcome_msg:
-            await update.message.reply_text(welcome_msg.replace("{username}", member.first_name))
+# ==========================================
+# 9. HELPERS
+# ==========================================
 
-# --- MAIN EXECUTION ---
+async def check_admin(update: Update) -> bool:
+    user = update.effective_user
+    chat = update.effective_chat
+    if chat.type == "private": return True
+    member = await chat.get_member(user.id)
+    if member.status in ['administrator', 'creator']:
+        return True
+    await update.message.reply_text("⛔ You are not an admin.")
+    return False
+
+async def get_target_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.reply_to_message:
+        return update.message.reply_to_message.from_user.id
+    if context.args:
+        try:
+            return int(context.args[0])
+        except:
+            await update.message.reply_text("⚠ Invalid ID.")
+            return None
+    await update.message.reply_text("⚠ Reply to a user or provide their ID.")
+    return None
+
+# ==========================================
+# 10. MAIN
+# ==========================================
 
 if __name__ == '__main__':
-    # Start Keep Alive for Cloud Hosting
-    keep_alive()
-    
-    if not TOKEN:
-        print("Error: BOT_TOKEN not found in .env")
-        exit()
+    load_data()
+    keep_alive() # Start Web Server
 
-    application = ApplicationBuilder().token(TOKEN).build()
+    app_bot = ApplicationBuilder().token(TOKEN).build()
 
     # Commands
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('help', help_command))
-    application.add_handler(CommandHandler('shout', shout))
-    application.add_handler(CommandHandler('genlink', genlink))
-    application.add_handler(CommandHandler('special_link', special_link))
-    application.add_handler(CommandHandler('shortener', shortener))
-    application.add_handler(CommandHandler('broadcast', broadcast))
-    application.add_handler(CommandHandler('kick', kick))
-    application.add_handler(CommandHandler('ban', ban))
-    application.add_handler(CommandHandler('mute', mute))
-    application.add_handler(CommandHandler('unmute', unmute))
-    application.add_handler(CommandHandler('clear', clear))
-    application.add_handler(CommandHandler('lock', lock))
-    application.add_handler(CommandHandler('setwelcome', setwelcome))
-    application.add_handler(CommandHandler('antiraid', antiraid))
-    application.add_handler(CommandHandler('link', create_invite_link))
+    app_bot.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("Bot is Online!")))
+    app_bot.add_handler(CommandHandler(["kick"], kick))
+    app_bot.add_handler(CommandHandler(["ban"], ban))
+    app_bot.add_handler(CommandHandler(["mute"], mute))
+    app_bot.add_handler(CommandHandler(["lock"], lock))
+    app_bot.add_handler(CommandHandler(["unlock"], unlock))
+    app_bot.add_handler(CommandHandler(["admin", "promote"], promote))
+    app_bot.add_handler(CommandHandler(["depromote"], depromote))
+    app_bot.add_handler(CommandHandler(["shout"], shout))
+    app_bot.add_handler(CommandHandler(["serverinfo", "chatinfo"], chatinfo))
+    app_bot.add_handler(CommandHandler(["userinfo"], userinfo))
+    app_bot.add_handler(CommandHandler(["avatar"], avatar))
     
-    # Handlers
-    application.add_handler(ChatJoinRequestHandler(handle_join_request))
-    application.add_handler(CallbackQueryHandler(join_decision_callback))
-    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
+    # Config
+    app_bot.add_handler(CommandHandler("blockword", blockword))
+    app_bot.add_handler(CommandHandler("autoreply", autoreply))
     
-    # AI Search and General Messages
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    # Ticket
+    app_bot.add_handler(CommandHandler("setup_ticket", setup_ticket))
+    app_bot.add_handler(CallbackQueryHandler(ticket_callback))
+
+    # All Messages (Must be last)
+    app_bot.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_handler))
 
     print("Bot is running...")
-    application.run_polling()
+    app_bot.run_polling()
